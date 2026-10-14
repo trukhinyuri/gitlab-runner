@@ -1215,6 +1215,37 @@ func TestSharedEnvVariables(t *testing.T) {
 	}
 }
 
+func TestSharedEnvVariables_DockerConfigIsolation(t *testing.T) {
+	t.Run("shared environment defaults DOCKER_CONFIG to per-build tmp dir", func(t *testing.T) {
+		build := Build{
+			BuildDir:         "/builds/runner/0/group/project",
+			ExecutorFeatures: FeaturesInfo{Shared: true},
+		}
+		assert.Equal(t, "/builds/runner/0/group/project.tmp/.docker", build.GetAllVariables().Get("DOCKER_CONFIG"))
+	})
+
+	t.Run("shared environment respects explicit job DOCKER_CONFIG override", func(t *testing.T) {
+		build := Build{
+			BuildDir:         "/builds/runner/0/group/project",
+			ExecutorFeatures: FeaturesInfo{Shared: true},
+			Job: spec.Job{
+				Variables: spec.Variables{
+					{Key: "DOCKER_CONFIG", Value: "/custom/docker/config", Public: true},
+				},
+			},
+		}
+		assert.Equal(t, "/custom/docker/config", build.GetAllVariables().Get("DOCKER_CONFIG"))
+	})
+
+	t.Run("disposable environment does not set default DOCKER_CONFIG", func(t *testing.T) {
+		build := Build{
+			BuildDir:         "/builds/runner/0/group/project",
+			ExecutorFeatures: FeaturesInfo{Shared: false},
+		}
+		assert.Empty(t, build.GetAllVariables().Get("DOCKER_CONFIG"))
+	})
+}
+
 func TestGetRemoteURL(t *testing.T) {
 	const (
 		exampleJobToken    = "job-token"

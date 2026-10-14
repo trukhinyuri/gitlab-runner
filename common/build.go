@@ -1970,6 +1970,18 @@ func (b *Build) RefreshAllVariables() {
 func (b *Build) getBaseVariablesBeforeJob() spec.Variables {
 	variables := make(spec.Variables, 0)
 
+	if b.IsSharedEnv() && b.BuildDir != "" {
+		variables = append(
+			variables,
+			spec.Variable{
+				Key:      "DOCKER_CONFIG",
+				Value:    b.platformAppropriatePath(path.Join(b.TmpProjectDir(), ".docker")),
+				Public:   true,
+				Internal: true,
+				File:     false,
+			},
+		)
+	}
 	if b.Image.Name != "" {
 		variables = append(
 			variables,
