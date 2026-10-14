@@ -1,0 +1,212 @@
+package shell
+
+import (
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/executors"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/featureflags"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/process"
+)
+
+var newProcessKillWaiter = process.NewOSKillWait
+var newCommander = process.NewOSCmd
+
+type executor struct {
+	executors.AbstractExecutor
+
+	// stepRunner is the provider-owned in-process step-runner shared across
+	// every shell build; Connect dials it (see steps.go).
+	stepRunner *stepRunnerServer
+}
+
+func (s *executor) Prepare(options common.ExecutorPrepareOptions) error {
+	if options.User != "" {
+		s.Shell().User = options.User
+	}
+
+	// expand environment variables to have current directory
+	wd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("getwd: %w", err)
+	}
+
+	mapping := func(key string) string {
+		switch key {
+		case "PWD":
+			return wd
+		default:
+			return ""
+		}
+	}
+
+	s.DefaultBuildsDir = os.Expand(s.DefaultBuildsDir, mapping)
+	s.DefaultCacheDir = os.Expand(s.DefaultCacheDir, mapping)
+
+	// Make paths absolute if they are relative
+	if !filepath.IsAbs(s.DefaultBuildsDir) {
+		s.DefaultBuildsDir = filepath.Join(wd, s.DefaultBuildsDir)
+	}
+	if !filepath.IsAbs(s.DefaultCacheDir) {
+		s.DefaultCacheDir = filepath.Join(wd, s.DefaultCacheDir)
+	}
+
+	// Pass control to executor
+	err = s.AbstractExecutor.Prepare(options)
+	if err != nil {
+		return err
+	}
+
+	s.BuildLogger.Println("Using Shell (" + s.Shell().Shell + ") executor...")
+	return nil
+}
+
+func (s *executor) Run(cmd common.ExecutorCommand) error {
+	s.BuildLogger.Debugln("Using new shell command execution")
+
+	stdout := s.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stdout)
+	defer stdout.Close()
+
+	stderr := s.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stderr)
+	defer stderr.Close()
+
+	cmdOpts := process.CommandOptions{
+		Env:                             os.Environ(),
+		Stdout:                          stdout,
+		Stderr:                          stderr,
+		UseWindowsLegacyProcessStrategy: s.Build.IsFeatureFlagOn(featureflags.UseWindowsLegacyProcessStrategy),
+		UseWindowsJobObject:             s.Build.IsFeatureFlagOn(featureflags.UseWindowsJobObject),
+	}
+
+	args := s.BuildShell.Arguments
+	stdin, args, cleanup, err := s.shellScriptArgs(cmd, args)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	cmdOpts.Stdin = stdin
+
+	// Create execution command
+	c := newCommander(s.BuildShell.Command, args, cmdOpts)
+
+	// Start a process
+	err = c.Start()
+	if err != nil {
+		return fmt.Errorf("failed to start process: %w", err)
+	}
+
+	// Wait for process to finish
+	waitCh := make(chan error, 1)
+	go func() {
+		waitErr := c.Wait()
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			// ExitCode is normalized for API and allow_failure matching.
+			// Inner is left as-is so the original message (e.g. "signal: killed") is preserved in the job log.
+			waitErr = &common.BuildError{
+				Inner:         waitErr,
+				ExitCode:      common.NormalizeExitCode(exitErr.ExitCode()),
+				FailureReason: common.ScriptFailure,
+			}
+		}
+		waitCh <- waitErr
+	}()
+
+	// Support process abort
+	select {
+	case err = <-waitCh:
+		return err
+	case <-cmd.Context.Done():
+		logger := common.NewProcessLoggerAdapter(s.BuildLogger)
+		return newProcessKillWaiter(logger, s.Config.GetGracefulKillTimeout(), s.Config.GetForceKillTimeout()).
+			KillAndWait(c, waitCh)
+	}
+}
+
+func (s *executor) shellScriptArgs(cmd common.ExecutorCommand, args []string) (io.Reader, []string, func(), error) {
+	if !s.BuildShell.PassFile {
+		return strings.NewReader(cmd.Script), args, func() {}, nil
+	}
+
+	scriptDir, err := os.MkdirTemp("", "build_script")
+	if err != nil {
+		return nil, nil, func() {}, fmt.Errorf("creating tmp build script dir: %w", err)
+	}
+
+	cleanup := func() {
+		err := os.RemoveAll(scriptDir)
+		if err != nil {
+			s.BuildLogger.Warningln("Failed to remove build script directory", scriptDir, err)
+		}
+	}
+
+	scriptFile := filepath.Join(scriptDir, "script."+s.BuildShell.Extension)
+	err = os.WriteFile(scriptFile, []byte(cmd.Script), 0o700)
+	if err != nil {
+		return nil, nil, cleanup, fmt.Errorf("writing script file: %w", err)
+	}
+
+	return nil, append(args, scriptFile), cleanup, nil
+}
+
+func NewProvider(runnerCommandPath string) common.ExecutorProvider {
+	options := executors.ExecutorOptions{
+		DefaultCustomBuildsDirEnabled: false,
+		DefaultSafeDirectoryCheckout:  false,
+		DefaultBuildsDir:              "builds",
+		DefaultCacheDir:               "cache",
+		SharedBuildsDir:               true,
+		Shell: common.ShellScriptInfo{
+			Shell:         common.GetDefaultShell(),
+			Type:          common.LoginShell,
+			RunnerCommand: runnerCommandPath,
+		},
+		ShowHostname: false,
+	}
+
+	// Shared by every shell build for the life of the runner; the server
+	// itself starts lazily on first use.
+	stepRunner := newStepRunnerServer()
+
+	creator := func() common.Executor {
+		return &executor{
+			AbstractExecutor: executors.AbstractExecutor{
+				ExecutorOptions: options,
+			},
+			stepRunner: stepRunner,
+		}
+	}
+
+	featuresUpdater := func(features *common.FeaturesInfo) {
+		features.Variables = true
+		features.Shared = true
+
+		if runtime.GOOS != "windows" {
+			features.Session = true
+			features.Terminal = true
+		}
+
+		// Shell runs native steps only via the concrete whole-job path;
+		// run: without FF_CONCRETE is rejected in Build.executeScript.
+		features.NativeStepsIntegration = true
+		features.NativeStepsViaConcreteOnly = true
+	}
+
+	return &provider{
+		DefaultExecutorProvider: executors.DefaultExecutorProvider{
+			Creator:          creator,
+			FeaturesUpdater:  featuresUpdater,
+			DefaultShellName: options.Shell.Shell,
+		},
+		stepRunner: stepRunner,
+	}
+}

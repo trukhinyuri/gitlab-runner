@@ -1,0 +1,41 @@
+# When adding a group as a code owner, make sure to invite the group to the
+# project here: https://gitlab.com/gitlab-org/gitlab-runner/-/project_members
+# As described in https://docs.gitlab.com/user/project/codeowners/
+
+* @gitlab-com/runner-maintainers
+.editorconfig   @gitlab-com/runner-group @gitlab-com/runner-maintainers
+.gitattributes  @gitlab-com/runner-group @gitlab-com/runner-maintainers
+.gitignore      @gitlab-com/runner-group @gitlab-com/runner-maintainers
+
+# Excluded from the * rule above. The Argo translation MR template is owned by the
+# [Localization] section below.
+!/.gitlab/.argo/
+
+[Hosted Runners] @gitlab-org/production-engineering/runners-platform
+.gitlab/ci/hosted-runners-bridge.gitlab-ci.yml
+magefiles/hosted_runners.go
+magefiles/hosted_runners/
+
+[Pipeline Security]
+helpers/vault/ @gitlab-com/pipeline-security-group/backend
+helpers/gcp_secret_manager/ @gitlab-com/pipeline-security-group/backend
+helpers/azure_key_vault/ @gitlab-com/pipeline-security-group/backend
+helpers/aws/ @gitlab-com/pipeline-security-group/backend
+helpers/gitlab_secrets_manager/ @gitlab-com/pipeline-security-group/backend
+helpers/conjur/ @gitlab-com/pipeline-security-group/backend
+helpers/secrets/ @gitlab-com/pipeline-security-group/backend
+
+[Documentation]
+/.markdownlint-cli2.yaml @gitlab-com/runner-docs-maintainers @gitlab-org/technical-writing/tw-docops @gitlab-org/tw-leadership
+/docs/ @gitlab-com/runner-docs-maintainers
+/docs/.vale/ @gitlab-org/technical-writing/tw-docops @gitlab-org/tw-leadership
+/docs/.markdownlint/ @gitlab-org/technical-writing/tw-docops @gitlab-org/tw-leadership
+/.gitlab/ci/docs.gitlab-ci.yml @gitlab-org/technical-writing/tw-docops @gitlab-org/tw-leadership
+
+[Localization]
+/docs-locale/ @gitlab-com/localization/maintainers/tech-docs
+/docs-locale/ja-jp @gitlab-com/localization/maintainers/tech-docs @gitlab-com/localization/maintainers/japanese
+/docs-locale/fr-fr @gitlab-com/localization/maintainers/tech-docs @gitlab-com/localization/maintainers/french
+/docs-locale/ko-kr @gitlab-com/localization/maintainers/tech-docs @gitlab-com/localization/maintainers/korean
+/argo_translation.yml @gitlab-com/localization/maintainers/tech-docs
+/.gitlab/.argo/ @gitlab-com/localization/maintainers/tech-docs

@@ -1,0 +1,1301 @@
+//go:build !integration
+
+package docker
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/netip"
+	"regexp"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/hashicorp/go-version"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/client"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/pull"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/container/helperimage"
+	service_test "gitlab.com/gitlab-org/gitlab-runner/helpers/container/services/test"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+	service_helpers "gitlab.com/gitlab-org/gitlab-runner/helpers/service"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/trace"
+)
+
+func testServiceFromNamedImage(t *testing.T, description, imageName, serviceName, platform string) {
+	c := docker.NewMockClient(t)
+	p := pull.NewMockManager(t)
+
+	servicePart := fmt.Sprintf("-%s-0", strings.ReplaceAll(serviceName, "/", "__"))
+	containerNameRegex, err := regexp.Compile("runner-abcdef123-project-0-concurrent-0-[^-]+" + servicePart)
+	require.NoError(t, err)
+
+	containerNameMatcher := mock.MatchedBy(containerNameRegex.MatchString)
+	networkID := "network-id"
+
+	e := &executor{
+		dockerConn: &dockerConnection{Client: c},
+		info: system.Info{
+			OSType:       helperimage.OSTypeLinux,
+			Architecture: "amd64",
+		},
+		pullManager: p,
+	}
+
+	e.Config = common.RunnerConfig{}
+	e.Config.Docker = &common.DockerConfig{}
+	e.Build = &common.Build{
+		ProjectRunnerID: 0,
+		Runner:          &common.RunnerConfig{},
+	}
+	e.Build.JobInfo.ProjectID = 0
+	e.Build.Runner.Token = "abcdef1234567890"
+	e.Context = t.Context()
+
+	e.helperImageInfo, err = helperimage.Get(common.AppVersion.Version, helperimage.Config{
+		OSType:        e.info.OSType,
+		Architecture:  e.info.Architecture,
+		KernelVersion: e.info.KernelVersion,
+	})
+	require.NoError(t, err)
+
+	e.serverAPIVersion = version.Must(version.NewVersion("1.43"))
+
+	err = e.createLabeler()
+	require.NoError(t, err)
+
+	e.BuildShell = &common.ShellConfiguration{}
+
+	realServiceContainerName := e.getProjectUniqRandomizedName() + servicePart
+	options := spec.ImageDockerOptions{}
+
+	p.On("GetDockerImage", imageName, options, []common.DockerPullPolicy(nil)).
+		Return(&image.InspectResponse{ID: "helper-image"}, nil).
+		Once()
+
+	c.On(
+		"ContainerRemove",
+		e.Context,
+		containerNameMatcher,
+		client.ContainerRemoveOptions{RemoveVolumes: true, Force: true},
+	).
+		Return(nil).
+		Once()
+
+	networkContainersMap := map[string]network.EndpointResource{
+		"1": {Name: realServiceContainerName},
+	}
+
+	c.On("NetworkList", e.Context, client.NetworkListOptions{}).
+		Return([]network.Summary{{Network: network.Network{ID: networkID, Name: "network-name"}}}, nil).
+		Once()
+
+	// disconnectNetwork inspects each listed network to find attached
+	// containers.
+	c.On("NetworkInspect", e.Context, networkID).
+		Return(network.Inspect{
+			Network:    network.Network{ID: networkID, Name: "network-name"},
+			Containers: networkContainersMap,
+		}, nil).
+		Once()
+
+	c.On("NetworkDisconnect", e.Context, networkID, containerNameMatcher, true).
+		Return(nil).
+		Once()
+
+	c.On("ContainerCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(container.CreateResponse{ID: realServiceContainerName}, nil).
+		Once()
+
+	c.On("ContainerStart", e.Context, mock.Anything, mock.Anything).
+		Return(nil).
+		Once()
+
+	c.On("ContainerInspect", e.Context, mock.Anything).
+		Return(container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{},
+			Config:          &container.Config{},
+			ID:              realServiceContainerName, State: &container.State{Status: container.StateRunning},
+		}, nil)
+
+	err = e.createVolumesManager()
+	require.NoError(t, err)
+
+	imageConfig := spec.Image{
+		Name: description,
+	}
+	if platform != "" {
+		imageConfig.ExecutorOptions = spec.ImageExecutorOptions{
+			Docker: spec.ImageDockerOptions{
+				Platform: "${PLATFORM}",
+			},
+		}
+		e.Build.Variables = append(e.Build.Variables, spec.Variable{
+			Key:   "PLATFORM",
+			Value: platform,
+		})
+	}
+
+	linksMap := make(map[string]*serviceInfo)
+	err = e.createFromServiceDefinition(0, imageConfig, linksMap)
+	assert.NoError(t, err)
+}
+
+func TestServiceFromNamedImage(t *testing.T) {
+	for _, test := range service_test.Services {
+		t.Run(test.Description, func(t *testing.T) {
+			testServiceFromNamedImage(t, test.Description, test.Image, test.Service, test.Platform)
+		})
+	}
+}
+
+func TestCreateFromServiceDefinition_AliasCollisionWarning(t *testing.T) {
+	logs := bytes.Buffer{}
+	lentry := logrus.New()
+	lentry.Out = io.Discard
+
+	e := &executor{}
+	e.BuildLogger = buildlogger.New(&common.Trace{Writer: &logs}, logrus.NewEntry(lentry), buildlogger.Options{})
+
+	existing := &serviceInfo{ID: "existing-container-id", Name: "existing"}
+	linksMap := map[string]*serviceInfo{
+		"nginx":  existing,
+		"shared": existing,
+	}
+
+	imageConfig := spec.Image{Name: "nginx:latest", Alias: "shared"}
+	require.NoError(t, e.createFromServiceDefinition(2, imageConfig, linksMap))
+
+	logOutput := logs.String()
+	assert.Contains(t, logOutput, `Skipping alias "nginx" for service "nginx:latest" (services[2]): alias is already in use by another service.`)
+	assert.Contains(t, logOutput, `Skipping alias "shared" for service "nginx:latest" (services[2]): alias is already in use by another service.`)
+}
+
+func testDockerConfigurationWithServiceContainer(
+	t *testing.T,
+	dockerConfig *common.DockerConfig,
+	cce containerConfigExpectations,
+) {
+	c, e := prepareTestDockerConfiguration(t, dockerConfig, cce, "alpine:latest", "alpine:latest")
+
+	c.On("ContainerStart", mock.Anything, "abc", mock.Anything).
+		Return(nil).Once()
+
+	c.On("ContainerInspect", e.Context, "abc").
+		Return(container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{},
+			Config:          &container.Config{},
+			ID:              "abc", State: &container.State{Status: container.StateRunning},
+		}, nil)
+
+	err := e.createVolumesManager()
+	require.NoError(t, err)
+
+	err = e.createPullManager()
+	require.NoError(t, err)
+
+	_, err = e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		spec.Image{Name: "alpine", Command: []string{"/bin/sh"}},
+		nil,
+	)
+	assert.NoError(t, err, "Should create service container without errors")
+}
+
+func TestDockerServiceDoesNotUseMacAddress(t *testing.T) {
+	dockerConfig := &common.DockerConfig{MacAddress: "92:d0:c6:0a:29:33"}
+	cce := func(t *testing.T, _ *container.Config, _ *container.HostConfig, netConfig *network.NetworkingConfig) {
+		require.NotEmpty(t, netConfig.EndpointsConfig)
+		for _, endpoint := range netConfig.EndpointsConfig {
+			assert.Empty(t, endpoint.MacAddress)
+		}
+	}
+
+	c, e := prepareTestDockerConfiguration(t, dockerConfig, cce, "alpine:latest", "alpine:latest")
+	e.serverAPIVersion = version.Must(version.NewVersion("1.44"))
+	c.On("ContainerStart", mock.Anything, "abc", mock.Anything).Return(nil).Once()
+	c.On("ContainerInspect", e.Context, "abc").Return(container.InspectResponse{
+		NetworkSettings: &container.NetworkSettings{},
+		Config:          &container.Config{},
+		ID:              "abc",
+		State:           &container.State{Status: container.StateRunning},
+	}, nil)
+
+	require.NoError(t, e.createVolumesManager())
+	require.NoError(t, e.createPullManager())
+
+	_, err := e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		spec.Image{Name: "alpine", Command: []string{"/bin/sh"}},
+		nil,
+	)
+	require.NoError(t, err)
+}
+
+func TestDockerServicesTmpfsSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		ServicesTmpfs: map[string]string{
+			"/tmpfs": "rw,noexec",
+		},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		require.NotEmpty(t, hostConfig.Tmpfs)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+}
+
+func TestDockerServicesCapAddCapDropSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		ServicesCapAdd:  []string{"NET_ADMIN", "SYS_TIME"},
+		ServicesCapDrop: []string{"ALL"},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		assert.EqualValues(t, dockerConfig.ServicesCapAdd, hostConfig.CapAdd)
+		assert.EqualValues(t, dockerConfig.ServicesCapDrop, hostConfig.CapDrop)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+}
+
+func TestDockerServicesDNSSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		DNS: []string{"2001:db8::1", "192.0.2.1"},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		require.Equal(t, []netip.Addr{
+			netip.MustParseAddr("2001:db8::1"),
+			netip.MustParseAddr("192.0.2.1"),
+		}, hostConfig.DNS)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+}
+
+func TestDockerServicesDNSSearchSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		DNSSearch: []string{"mydomain.example"},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		require.Equal(t, dockerConfig.DNSSearch, hostConfig.DNSSearch)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+}
+
+func TestDockerServicesExtraHostsSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		ExtraHosts: []string{"foo.example:2001:db8::1", "bar.example:192.0.2.1"},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		require.Equal(t, dockerConfig.ExtraHosts, hostConfig.ExtraHosts)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+}
+
+func TestDockerServiceUserNSSetting(t *testing.T) {
+	dockerConfig := &common.DockerConfig{}
+	dockerConfigWithHostUsernsMode := &common.DockerConfig{
+		UsernsMode: "host",
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		assert.Equal(t, container.UsernsMode(""), hostConfig.UsernsMode)
+	}
+	cceWithHostUsernsMode := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+		assert.Equal(t, container.UsernsMode("host"), hostConfig.UsernsMode)
+	}
+
+	testDockerConfigurationWithServiceContainer(t, dockerConfig, cce)
+	testDockerConfigurationWithServiceContainer(t, dockerConfigWithHostUsernsMode, cceWithHostUsernsMode)
+}
+
+type testAllowedPrivilegedServiceDescription struct {
+	expectedPrivileged bool
+	privileged         bool
+	allowedImages      []string
+}
+
+var testAllowedPrivilegedService = []testAllowedPrivilegedServiceDescription{
+	{true, true, []string{}},
+	{true, true, []string{"*"}},
+	{false, true, []string{"*:*"}},
+	{false, true, []string{"*/*"}},
+	{false, true, []string{"*/*:*"}},
+	{true, true, []string{"**/*"}},
+	{false, true, []string{"**/*:*"}},
+	{true, true, []string{"alpine"}},
+	{false, true, []string{"debian"}},
+	{true, true, []string{"alpi*"}},
+	{true, true, []string{"*alpi*"}},
+	{true, true, []string{"*alpi*"}},
+	{true, true, []string{"debian", "alpine"}},
+	{true, true, []string{"debian", "*"}},
+	{false, false, []string{}},
+	{false, false, []string{"*"}},
+	{false, false, []string{"*:*"}},
+	{false, false, []string{"*/*"}},
+	{false, false, []string{"*/*:*"}},
+	{false, false, []string{"**/*"}},
+	{false, false, []string{"**/*:*"}},
+	{false, false, []string{"alpine"}},
+	{false, false, []string{"debian"}},
+	{false, false, []string{"alpi*"}},
+	{false, false, []string{"*alpi*"}},
+	{false, false, []string{"*alpi*"}},
+	{false, false, []string{"debian", "alpine"}},
+	{false, false, []string{"debian", "*"}},
+}
+
+func TestDockerServicePrivilegedSetting(t *testing.T) {
+	for _, test := range testAllowedPrivilegedService {
+		dockerConfigWithoutServicePrivileged := &common.DockerConfig{
+			Privileged:                test.privileged,
+			ServicesPrivileged:        nil,
+			AllowedPrivilegedServices: test.allowedImages,
+		}
+		dockerConfigWithPrivileged := &common.DockerConfig{
+			Privileged:                true,
+			ServicesPrivileged:        &test.privileged,
+			AllowedPrivilegedServices: test.allowedImages,
+		}
+		dockerConfigWithoutPrivileged := &common.DockerConfig{
+			Privileged:                false,
+			ServicesPrivileged:        &test.privileged,
+			AllowedPrivilegedServices: test.allowedImages,
+		}
+
+		cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+			var message string
+			if test.expectedPrivileged {
+				message = "%q must be allowed by %q"
+			} else {
+				message = "%q must not be allowed by %q"
+			}
+			assert.Equal(t, test.expectedPrivileged, hostConfig.Privileged, message, "alpine", test.allowedImages)
+		}
+
+		testDockerConfigurationWithServiceContainer(t, dockerConfigWithoutServicePrivileged, cce)
+		testDockerConfigurationWithServiceContainer(t, dockerConfigWithPrivileged, cce)
+		testDockerConfigurationWithServiceContainer(t, dockerConfigWithoutPrivileged, cce)
+	}
+}
+
+func TestDockerWithNoDockerConfigAndWithServiceImagePullPolicyAlways(t *testing.T) {
+	dockerConfig := &common.DockerConfig{}
+	serviceConfig := spec.Image{
+		Name:         "alpine",
+		PullPolicies: []common.DockerPullPolicy{common.PullPolicyAlways},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+	}
+
+	c, e := prepareTestDockerConfiguration(t, dockerConfig, cce, "alpine:latest", "alpine:latest")
+
+	c.On("ContainerStart", mock.Anything, "abc", mock.Anything).
+		Return(nil).Once()
+
+	c.On("ContainerInspect", e.Context, "abc").
+		Return(container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{},
+			Config:          &container.Config{},
+			ID:              "abc", State: &container.State{Status: container.StateRunning},
+		}, nil)
+
+	err := e.createVolumesManager()
+	require.NoError(t, err)
+
+	err = e.createPullManager()
+	require.NoError(t, err)
+
+	_, err = e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		serviceConfig,
+		nil,
+	)
+	assert.NoError(t, err, "Should create service container without errors")
+}
+
+func TestDockerWithDockerConfigAlwaysAndIfNotPresentAndWithServiceImagePullPolicyIfNotPresent(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		PullPolicy: common.StringOrArray{common.PullPolicyAlways, common.PullPolicyIfNotPresent},
+	}
+	serviceConfig := spec.Image{
+		Name:         "alpine",
+		PullPolicies: []common.DockerPullPolicy{common.PullPolicyIfNotPresent},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+	}
+
+	c, e := createExecutorForTestDockerConfiguration(t, dockerConfig, cce)
+
+	c.On("ImageInspectWithRaw", mock.Anything, "alpine:latest", mock.Anything).
+		Return(image.InspectResponse{ID: "123"}, []byte{}, nil).Once()
+	c.On("NetworkList", mock.Anything, mock.Anything).
+		Return([]network.Summary{}, nil).Once()
+	c.On("ContainerRemove", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Once()
+	c.On("ContainerStart", mock.Anything, "abc", mock.Anything).
+		Return(nil).Once()
+	c.On("ContainerInspect", e.Context, "abc").
+		Return(container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{},
+			Config:          &container.Config{},
+			ID:              "abc", State: &container.State{Status: container.StateRunning},
+		}, nil)
+
+	err := e.createVolumesManager()
+	require.NoError(t, err)
+
+	err = e.createPullManager()
+	require.NoError(t, err)
+
+	_, err = e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		serviceConfig,
+		nil,
+	)
+	assert.NoError(t, err, "Should create service container without errors")
+}
+
+func TestDockerWithDockerConfigAlwaysButNotAllowedAndWithNoServiceImagePullPolicy(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		PullPolicy:          common.StringOrArray{common.PullPolicyAlways},
+		AllowedPullPolicies: []common.DockerPullPolicy{common.PullPolicyIfNotPresent},
+	}
+	serviceConfig := spec.Image{Name: "alpine"}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+	}
+	_, e := createExecutorForTestDockerConfiguration(t, dockerConfig, cce)
+
+	err := e.createVolumesManager()
+	require.NoError(t, err)
+
+	err = e.createPullManager()
+	require.NoError(t, err)
+
+	_, err = e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		serviceConfig,
+		nil,
+	)
+	assert.Contains(
+		t,
+		err.Error(),
+		`invalid pull policy for image "alpine:latest"`,
+	)
+	assert.Regexp(t, regexp.MustCompile(`always.* Runner config .*if-not-present`), err.Error())
+}
+
+func TestDockerWithDockerConfigAlwaysAndWithServiceImagePullPolicyIfNotPresent(t *testing.T) {
+	dockerConfig := &common.DockerConfig{
+		PullPolicy:          common.StringOrArray{common.PullPolicyAlways},
+		AllowedPullPolicies: []common.DockerPullPolicy{common.PullPolicyAlways},
+	}
+	serviceConfig := spec.Image{
+		Name:         "alpine",
+		PullPolicies: []common.DockerPullPolicy{common.PullPolicyIfNotPresent},
+	}
+
+	cce := func(t *testing.T, config *container.Config, hostConfig *container.HostConfig, _ *network.NetworkingConfig) {
+	}
+	_, e := createExecutorForTestDockerConfiguration(t, dockerConfig, cce)
+
+	err := e.createVolumesManager()
+	require.NoError(t, err)
+
+	err = e.createPullManager()
+	require.NoError(t, err)
+
+	_, err = e.createService(
+		0,
+		"alpine",
+		"latest",
+		"alpine:latest",
+		serviceConfig,
+		nil,
+	)
+	assert.Contains(
+		t,
+		err.Error(),
+		`invalid pull policy for image "alpine:latest"`,
+	)
+	assert.Regexp(t, regexp.MustCompile(`if-not-present.* GitLab pipeline config .*always`), err.Error())
+}
+
+func TestGetServiceDefinitions(t *testing.T) {
+	e := new(executor)
+	e.Build = &common.Build{
+		Runner: &common.RunnerConfig{},
+	}
+	e.Config = common.RunnerConfig{}
+	e.Config.Docker = &common.DockerConfig{}
+
+	testServicesLimit := func(i int) *int {
+		return &i
+	}
+
+	tests := map[string]struct {
+		services         []common.Service
+		servicesLimit    *int
+		buildServices    []spec.Image
+		allowedServices  []string
+		expectedServices spec.Services
+		expectedErr      string
+	}{
+		"all services with proper name and alias": {
+			services: []common.Service{
+				{
+					Name:       "name",
+					Alias:      "alias",
+					Command:    []string{"executable", "param1", "param2"},
+					Entrypoint: []string{"executable", "param3", "param4"},
+				},
+				{
+					Name:    "name2",
+					Alias:   "alias2",
+					Command: []string{"executable", "param1", "param2"},
+				},
+				{
+					Name:       "name3",
+					Alias:      "alias3",
+					Entrypoint: []string{"executable", "param3", "param4"},
+				},
+			},
+			expectedServices: spec.Services{
+				{
+					Name:       "name",
+					Alias:      "alias",
+					Command:    []string{"executable", "param1", "param2"},
+					Entrypoint: []string{"executable", "param3", "param4"},
+				},
+				{
+					Name:    "name2",
+					Alias:   "alias2",
+					Command: []string{"executable", "param1", "param2"},
+				},
+				{
+					Name:       "name3",
+					Alias:      "alias3",
+					Entrypoint: []string{"executable", "param3", "param4"},
+				},
+			},
+		},
+		"build service not in internal images but empty allowed services": {
+			services: []common.Service{
+				{
+					Name:  "name",
+					Alias: "alias",
+				},
+			},
+			buildServices: []spec.Image{
+				{
+					Name: "name_not_in_internal",
+				},
+			},
+			expectedServices: spec.Services{
+				{
+					Name:  "name",
+					Alias: "alias",
+				},
+				{
+					Name: "name_not_in_internal",
+				},
+			},
+		},
+		"build service not in internal images": {
+			services: []common.Service{
+				{
+					Name: "name",
+				},
+			},
+			buildServices: []spec.Image{
+				{
+					Name: "name_not_in_internal",
+				},
+			},
+			allowedServices: []string{"name"},
+			expectedErr:     "disallowed image",
+		},
+		"build service not in allowed services but in internal images": {
+			services: []common.Service{
+				{
+					Name: "name",
+				},
+			},
+			buildServices: []spec.Image{
+				{
+					Name: "name",
+				},
+			},
+			allowedServices: []string{"allowed_name"},
+			expectedServices: spec.Services{
+				{
+					Name: "name",
+				},
+				{
+					Name: "name",
+				},
+			},
+		},
+		"empty service name": {
+			services: []common.Service{
+				{
+					Name: "",
+				},
+			},
+			buildServices: []spec.Image{},
+			expectedServices: spec.Services{
+				{
+					Name: "",
+				},
+			},
+		},
+		"requested 1 service, max 0": {
+			services: []common.Service{
+				{
+					Name: "name",
+				},
+			},
+			servicesLimit: testServicesLimit(0),
+			expectedErr:   (&tooManyServicesRequestedError{requested: 1, allowed: 0}).Error(),
+		},
+		"requested 1 service, max 1": {
+			services: []common.Service{
+				{
+					Name: "name",
+				},
+			},
+			servicesLimit: testServicesLimit(1),
+			expectedServices: spec.Services{
+				{
+					Name: "name",
+				},
+			},
+		},
+		"requested 2 services, max 1": {
+			services: []common.Service{
+				{
+					Name: "name",
+				},
+				{
+					Name: "name",
+				},
+			},
+			servicesLimit: testServicesLimit(1),
+			expectedErr:   (&tooManyServicesRequestedError{requested: 2, allowed: 1}).Error(),
+		},
+	}
+
+	for tn, tt := range tests {
+		t.Run(tn, func(t *testing.T) {
+			e.Config.Docker.Services = tt.services
+			e.Config.Docker.AllowedServices = tt.allowedServices
+			e.Config.Docker.ServicesLimit = tt.servicesLimit
+			e.Build.Services = tt.buildServices
+
+			svcs, err := e.getServicesDefinitions()
+			if tt.expectedErr != "" {
+				assert.EqualError(t, err, tt.expectedErr)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expectedServices, svcs)
+		})
+	}
+}
+
+func TestAddServiceHealthCheck(t *testing.T) {
+	tests := map[string]struct {
+		networkMode            string
+		dockerClientAssertions func(*docker.MockClient)
+		expectedEnvironment    []string
+		expectedExposePortsErr string
+		expectedHealthcheckErr string
+	}{
+		"get ports via environment": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: network.PortSet{network.MustParsePort("1000/tcp"): {}},
+						},
+					}, nil).
+					Once()
+			},
+			expectedEnvironment: []string{
+				"WAIT_FOR_SERVICE_TCP_ADDR=000000000000",
+				"WAIT_FOR_SERVICE_1000_TCP_PORT=1000",
+			},
+		},
+		"get port from many": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: exposedPortSet(
+								"1000/tcp", "500/udp", "600/tcp", "1500/tcp",
+								"1600/tcp", "1601/tcp",
+								"1700/tcp", "1701/tcp", "1702/tcp", "1703/tcp", "1704/tcp", "1705/tcp",
+							),
+						},
+					}, nil).
+					Once()
+			},
+			expectedEnvironment: []string{
+				"WAIT_FOR_SERVICE_TCP_ADDR=000000000000",
+				"WAIT_FOR_SERVICE_600_TCP_PORT=600",
+				"WAIT_FOR_SERVICE_1000_TCP_PORT=1000",
+				"WAIT_FOR_SERVICE_1500_TCP_PORT=1500",
+				"WAIT_FOR_SERVICE_1600_TCP_PORT=1600",
+				"WAIT_FOR_SERVICE_1601_TCP_PORT=1601",
+				"WAIT_FOR_SERVICE_1700_TCP_PORT=1700",
+				"WAIT_FOR_SERVICE_1701_TCP_PORT=1701",
+				"WAIT_FOR_SERVICE_1702_TCP_PORT=1702",
+				"WAIT_FOR_SERVICE_1703_TCP_PORT=1703",
+				"WAIT_FOR_SERVICE_1704_TCP_PORT=1704",
+				"WAIT_FOR_SERVICE_1705_TCP_PORT=1705",
+			},
+		},
+		"get port from many (limited to 20)": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: exposedPortRange(1000, 1100),
+						},
+					}, nil).
+					Once()
+			},
+			expectedEnvironment: []string{
+				"WAIT_FOR_SERVICE_TCP_ADDR=000000000000",
+				"WAIT_FOR_SERVICE_1000_TCP_PORT=1000",
+				"WAIT_FOR_SERVICE_1001_TCP_PORT=1001",
+				"WAIT_FOR_SERVICE_1002_TCP_PORT=1002",
+				"WAIT_FOR_SERVICE_1003_TCP_PORT=1003",
+				"WAIT_FOR_SERVICE_1004_TCP_PORT=1004",
+				"WAIT_FOR_SERVICE_1005_TCP_PORT=1005",
+				"WAIT_FOR_SERVICE_1006_TCP_PORT=1006",
+				"WAIT_FOR_SERVICE_1007_TCP_PORT=1007",
+				"WAIT_FOR_SERVICE_1008_TCP_PORT=1008",
+				"WAIT_FOR_SERVICE_1009_TCP_PORT=1009",
+				"WAIT_FOR_SERVICE_1010_TCP_PORT=1010",
+				"WAIT_FOR_SERVICE_1011_TCP_PORT=1011",
+				"WAIT_FOR_SERVICE_1012_TCP_PORT=1012",
+				"WAIT_FOR_SERVICE_1013_TCP_PORT=1013",
+				"WAIT_FOR_SERVICE_1014_TCP_PORT=1014",
+				"WAIT_FOR_SERVICE_1015_TCP_PORT=1015",
+				"WAIT_FOR_SERVICE_1016_TCP_PORT=1016",
+				"WAIT_FOR_SERVICE_1017_TCP_PORT=1017",
+				"WAIT_FOR_SERVICE_1018_TCP_PORT=1018",
+				"WAIT_FOR_SERVICE_1019_TCP_PORT=1019",
+			},
+		},
+		"get port from container variable": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: network.PortSet{network.MustParsePort("1000/tcp"): {}},
+							Env: []string{
+								"HEALTHCHECK_TCP_PORT=2000",
+							},
+						},
+					}, nil).
+					Once()
+			},
+			expectedEnvironment: []string{
+				"WAIT_FOR_SERVICE_TCP_ADDR=000000000000",
+				"WAIT_FOR_SERVICE_2000_TCP_PORT=2000",
+			},
+		},
+		"get port from container variable - case insensitive": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: network.PortSet{network.MustParsePort("1000/tcp"): {}},
+							Env: []string{
+								"healthcheck_TCP_PORT=2000",
+							},
+						},
+					}, nil).
+					Once()
+			},
+			expectedEnvironment: []string{
+				"WAIT_FOR_SERVICE_TCP_ADDR=000000000000",
+				"WAIT_FOR_SERVICE_2000_TCP_PORT=2000",
+			},
+		},
+		"get port from container variable (invalid)": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: network.PortSet{network.MustParsePort("1000/tcp"): {}},
+							Env: []string{
+								"HEALTHCHECK_TCP_PORT=hello",
+							},
+						},
+					}, nil).
+					Once()
+			},
+			expectedExposePortsErr: fmt.Sprintf("invalid health check tcp port: %v", "hello"),
+		},
+		"no ports defined": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{
+						NetworkSettings: &container.NetworkSettings{},
+						ID:              "default", State: &container.State{Status: container.StateRunning},
+						Config: &container.Config{
+							ExposedPorts: network.PortSet{},
+						},
+					}, nil).
+					Once()
+			},
+			expectedHealthcheckErr: fmt.Sprintf("service %q has no exposed ports", "default"),
+		},
+		"container inspect error": {
+			networkMode: "test",
+			dockerClientAssertions: func(c *docker.MockClient) {
+				c.On("ContainerInspect", mock.Anything, mock.Anything).
+					Return(container.InspectResponse{}, fmt.Errorf("%v", "test error")).
+					Once()
+			},
+			expectedExposePortsErr: "test error",
+		},
+	}
+
+	for name, test := range tests {
+		t.Run(name, func(t *testing.T) {
+			client := docker.NewMockClient(t)
+
+			if test.dockerClientAssertions != nil {
+				test.dockerClientAssertions(client)
+			}
+
+			executor := &executor{
+				networkMode: container.NetworkMode(test.networkMode),
+				dockerConn:  &dockerConnection{Client: client},
+			}
+			executor.Config.Docker = &common.DockerConfig{}
+
+			ip, ports, err := executor.getContainerIPAndExposedPorts("0000000000000000000000000000000000000000000000000000000000000000")
+			if test.expectedExposePortsErr != "" {
+				assert.ErrorContains(t, err, test.expectedExposePortsErr)
+				return
+			} else {
+				assert.NoError(t, err)
+			}
+
+			service := &serviceInfo{
+				ID:    "0000000000000000000000000000000000000000000000000000000000000000",
+				Name:  "default",
+				IP:    ip,
+				Ports: ports,
+			}
+
+			environment, err := executor.addServiceHealthCheckEnvironment(service)
+
+			if test.expectedHealthcheckErr != "" {
+				assert.ErrorContains(t, err, test.expectedExposePortsErr)
+			} else {
+				assert.NoError(t, err)
+				assert.Equal(t, test.expectedEnvironment, environment)
+			}
+		})
+	}
+}
+
+func TestCreateHostConfigForServiceHealthCheck(t *testing.T) {
+	tests := map[string]struct {
+		service  *serviceInfo
+		expected []string
+	}{
+		"no addresses": {
+			service:  &serviceInfo{ID: "abcdef123456789012"},
+			expected: nil,
+		},
+		"single ipv4 address": {
+			service:  &serviceInfo{ID: "abcdef123456789012", IP: []string{"172.21.0.2"}},
+			expected: []string{"abcdef123456:172.21.0.2"},
+		},
+		"ipv4 and ipv6 addresses are both preserved": {
+			service:  &serviceInfo{ID: "abcdef123456789012", IP: []string{"172.21.0.2", "fd00:3993:9::2"}},
+			expected: []string{"abcdef123456:172.21.0.2", "abcdef123456:fd00:3993:9::2"},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			e := &executor{}
+
+			hostConfig := e.createHostConfigForServiceHealthCheck(tt.service)
+
+			assert.Equal(t, tt.expected, hostConfig.ExtraHosts)
+		})
+	}
+}
+
+func Test_Executor_captureContainerLogs(t *testing.T) {
+	const (
+		cID   = "some container"
+		cName = cID
+		msg   = "pretend this is a log generated by a process in a container"
+	)
+
+	tests := map[string]struct {
+		header  []byte
+		wantLog string
+		wantErr error
+	}{
+		"success": {
+			// for header spec see https://pkg.go.dev/github.com/moby/moby/client#Client.ContainerLogs
+			header:  []byte{1, 0, 0, 0, 0, 0, 0, byte(len(msg))},
+			wantLog: msg,
+		},
+		"read error": {
+			wantLog: "error streaming logs for container some container: unrecognized stream:",
+		},
+		"connect error": {
+			wantErr: errors.New("blammo"),
+			wantLog: "failed to open log stream for container " + cName + ": blammo",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			c := docker.NewMockClient(t)
+			e := &executor{}
+			e.dockerConn = &dockerConnection{Client: c}
+
+			buf, err := trace.New()
+			require.NoError(t, err)
+			defer buf.Close()
+
+			trace := &common.Trace{Writer: buf}
+			e.BuildLogger = buildlogger.New(trace, logrus.WithFields(logrus.Fields{}), buildlogger.Options{})
+
+			isw := service_helpers.NewInlineServiceLogWriter(cName, trace)
+
+			// we'll write into pw, which will be copied to pr and simulate a process in
+			// a container writing to stdout.
+			pr, pw := io.Pipe()
+			defer pw.Close() // ... for the failure case
+
+			ctx := t.Context()
+			c.On("ContainerLogs", ctx, cID, mock.Anything).Return(pr, tt.wantErr).Once()
+			err = e.captureContainerLogs(ctx, cID, cName, isw)
+
+			if tt.wantErr != nil {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantLog)
+				return
+			}
+
+			require.NoError(t, err)
+
+			// this will be copied to pr...
+			_, err = pw.Write(append(tt.header, msg...))
+			require.NoError(t, err)
+			pw.Close() // this will also close pr
+
+			assert.EventuallyWithT(t, func(t *assert.CollectT) {
+				contents, err := buf.Bytes(0, math.MaxInt64)
+				assert.NoError(t, err)
+				assert.Contains(t, string(contents), tt.wantLog)
+			}, time.Millisecond*500, time.Millisecond+10)
+		})
+	}
+}
+
+func newTestExecutor(t *testing.T, c *docker.MockClient) *executor {
+	t.Helper()
+
+	e := &executor{
+		dockerConn: &dockerConnection{Client: c},
+		info: system.Info{
+			OSType:       helperimage.OSTypeLinux,
+			Architecture: "amd64",
+		},
+	}
+	e.BuildLogger = buildlogger.New(nil, logrus.WithFields(logrus.Fields{}), buildlogger.Options{})
+	e.Config.Docker = &common.DockerConfig{}
+	e.Build = &common.Build{
+		Runner: &common.RunnerConfig{},
+	}
+	e.Build.Token = "abcd123456"
+	e.BuildShell = &common.ShellConfiguration{}
+
+	var err error
+	e.helperImageInfo, err = helperimage.Get(common.AppVersion.Version, helperimage.Config{
+		OSType:        e.info.OSType,
+		Architecture:  e.info.Architecture,
+		KernelVersion: e.info.KernelVersion,
+	})
+	require.NoError(t, err)
+	require.NoError(t, e.createLabeler())
+	e.serverAPIVersion = version.Must(version.NewVersion("1.43"))
+	e.Context = t.Context()
+	return e
+}
+
+func TestCreateService(t *testing.T) {
+	c := docker.NewMockClient(t)
+	e := newTestExecutor(t, c)
+
+	const freshID = "fresh-service-container-id"
+
+	c.On("ImageInspectWithRaw", mock.Anything, "alpine:latest", mock.Anything).
+		Return(image.InspectResponse{ID: "some-image-id"}, []byte{}, nil).Twice()
+	c.On("ImagePullBlocking", mock.Anything, "alpine:latest", mock.Anything).
+		Return(nil).Once()
+
+	c.On("NetworkList", mock.Anything, mock.Anything).
+		Return([]network.Summary{}, nil).Once()
+	c.On("ContainerRemove", mock.Anything, mock.Anything, mock.Anything).
+		Return(nil).Once()
+
+	c.On("ContainerCreate", mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything, mock.Anything).
+		Return(container.CreateResponse{ID: freshID}, nil).Once()
+
+	c.On("ContainerStart", e.Context, freshID, client.ContainerStartOptions{}).
+		Return(nil).Once()
+
+	c.On("ContainerInspect", e.Context, freshID).
+		Return(container.InspectResponse{
+			NetworkSettings: &container.NetworkSettings{},
+			Config:          &container.Config{},
+			ID:              freshID, State: &container.State{Status: container.StateRunning},
+		}, nil).Once()
+
+	require.NoError(t, e.createVolumesManager())
+	require.NoError(t, e.createPullManager())
+
+	info, err := e.createService(0, "alpine", "latest", "alpine:latest",
+		spec.Image{Name: "alpine"}, nil)
+	require.NoError(t, err)
+
+	assert.Equal(t, freshID, info.ID)
+}
+
+func TestResumeServices(t *testing.T) {
+	c := docker.NewMockClient(t)
+	e := newTestExecutor(t, c)
+	e.Config.Docker.WaitForServicesTimeout = -1
+
+	svcInspect := container.InspectResponse{
+		ID:    "svc-a",
+		Name:  "/svc-a",
+		State: &container.State{Status: "running"},
+		NetworkSettings: &container.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"bridge": {IPAddress: netip.MustParseAddr("172.17.0.4")},
+			},
+		},
+		Config: &container.Config{
+			ExposedPorts: network.PortSet{network.MustParsePort("80/tcp"): {}},
+		},
+	}
+
+	c.On("ContainerInspect", mock.Anything, "svc-a").Return(svcInspect, nil)
+	c.On("ContainerStart", mock.Anything, "svc-a", client.ContainerStartOptions{}).Return(nil).Once()
+
+	require.NoError(t, e.resumeServices([]string{"svc-a"}))
+
+	require.Len(t, e.services, 1)
+	assert.Equal(t, "svc-a", e.services[0].ID)
+	assert.Equal(t, "/svc-a", e.services[0].Name)
+	assert.Equal(t, []string{"172.17.0.4"}, e.services[0].IP)
+	assert.Equal(t, []int{80}, e.services[0].Ports)
+	assert.Contains(t, e.temporary, "svc-a")
+}
+
+func TestResumeServices_serviceNotFound(t *testing.T) {
+	c := docker.NewMockClient(t)
+	e := newTestExecutor(t, c)
+
+	c.On("ContainerInspect", mock.Anything, "missing-svc").
+		Return(container.InspectResponse{}, errors.New("not found")).Once()
+
+	err := e.resumeServices([]string{"missing-svc"})
+	require.EqualError(t, err, "service container missing-svc not found: not found")
+}
+
+func TestResumeServices_startFails(t *testing.T) {
+	c := docker.NewMockClient(t)
+	e := newTestExecutor(t, c)
+
+	c.On("ContainerInspect", mock.Anything, "svc-broken").
+		Return(container.InspectResponse{
+			ID: "svc-broken",
+		}, nil).Once()
+	c.On("ContainerStart", mock.Anything, "svc-broken", client.ContainerStartOptions{}).
+		Return(errors.New("daemon error")).Once()
+
+	err := e.resumeServices([]string{"svc-broken"})
+	require.EqualError(t, err, "service container svc-broken failed to start: daemon error")
+}
+
+func Test_Executor_captureContainersLogs(t *testing.T) {
+	containers := []*serviceInfo{
+		{
+			ID:   "000000000000000000000000000000000",
+			Name: "some container",
+		},
+		{
+			ID:   "111111111111111111111111111111111",
+			Name: "some other container",
+		},
+	}
+
+	linksMap := map[string]*serviceInfo{
+		"one":       containers[0],
+		"two":       containers[1],
+		"two-alias": containers[1],
+	}
+
+	logs := bytes.Buffer{}
+	lentry := logrus.New()
+	lentry.Out = &logs
+
+	stop := errors.New("don't actually try to stream the container's logs")
+	c := docker.NewMockClient(t)
+
+	e := &executor{services: containers}
+	e.dockerConn = &dockerConnection{Client: c}
+	e.BuildLogger = buildlogger.New(&common.Trace{Writer: &logs}, logrus.NewEntry(lentry), buildlogger.Options{})
+	e.Build = &common.Build{}
+
+	ctx := t.Context()
+
+	tests := map[string]struct {
+		debugServicePolicy string
+		expect             func()
+		assert             func(t *testing.T)
+	}{
+		"enabled": {
+			debugServicePolicy: "true",
+			expect: func() {
+				for _, cont := range containers {
+					// have the call to ContainerLogs return an error so we
+					// don't have to mock more behaviour. that functionality is
+					// tested elsewhere.
+					c.On("ContainerLogs", ctx, cont.ID, mock.Anything).Return(nil, stop).Once()
+				}
+			},
+			assert: func(t *testing.T) {
+				for _, c := range containers {
+					assert.Contains(t, logs.String(), "WARNING: failed to open log stream for container "+
+						c.Name+": "+stop.Error())
+				}
+			},
+		},
+		"disabled": {
+			debugServicePolicy: "false",
+			expect:             func() {},
+			assert:             func(t *testing.T) { assert.Empty(t, logs.String()) },
+		},
+		"bogus": {
+			debugServicePolicy: "blammo",
+			expect:             func() {},
+			assert:             func(t *testing.T) { assert.Empty(t, logs.String()) },
+		},
+	}
+
+	for name, tt := range tests {
+		logs.Reset()
+		t.Run(name, func(t *testing.T) {
+			e.Build = &common.Build{}
+			e.Build.Variables = spec.Variables{
+				{Key: "CI_DEBUG_SERVICES", Value: tt.debugServicePolicy, Public: true},
+			}
+
+			tt.expect()
+			e.captureContainersLogs(ctx, linksMap)
+			tt.assert(t)
+		})
+	}
+}
+
+// exposedPortSet builds a network.PortSet from port specs (e.g. "80/tcp").
+// A network.Port is a single port, so ranges must be expressed as individual
+// ports.
+func exposedPortSet(specs ...string) network.PortSet {
+	set := network.PortSet{}
+	for _, s := range specs {
+		set[network.MustParsePort(s)] = struct{}{}
+	}
+	return set
+}
+
+// exposedPortRange builds a network.PortSet covering the inclusive tcp port
+// range [start, end], mirroring how the daemon expands exposed ranges.
+func exposedPortRange(start, end uint16) network.PortSet {
+	set := network.PortSet{}
+	// p is int, not uint16, so this doesn't infinite-loop when end == 65535
+	// (uint16's max value would otherwise wrap p back to 0 after p++).
+	for p := int(start); p <= int(end); p++ {
+		set[network.MustParsePort(fmt.Sprintf("%d/tcp", p))] = struct{}{}
+	}
+	return set
+}

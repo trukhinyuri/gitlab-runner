@@ -1,0 +1,501 @@
+package docker
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
+	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/exec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/user"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/featureflags"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/limitwriter"
+)
+
+const (
+	buildContainerType      = "build"
+	predefinedContainerType = "predefined"
+)
+
+type commandExecutor struct {
+	executor
+	lock                            sync.Mutex
+	terminalWaitForContainerTimeout time.Duration
+}
+
+var _ common.SuspendableExecutor = (*commandExecutor)(nil)
+
+func (s *commandExecutor) getBuildContainer() *container.InspectResponse {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	return s.buildContainer
+}
+
+func (s *commandExecutor) Prepare(options common.ExecutorPrepareOptions) error {
+	err := s.executor.Prepare(options)
+	if err != nil {
+		return err
+	}
+
+	s.BuildLogger.Debugln("Starting Docker command...")
+
+	if len(s.BuildShell.DockerCommand) == 0 {
+		return &common.BuildError{
+			Inner:         errors.New("script is not compatible with Docker"),
+			FailureReason: common.ConfigurationError,
+		}
+	}
+
+	if s.Build.RuntimeEnvironmentKey() == "" {
+		_, err = s.getHelperImage()
+		if err != nil {
+			return err
+		}
+
+		_, err = s.getBuildImage()
+		if err != nil {
+			return err
+		}
+	}
+
+	if s.isUmaskDisabled() {
+		s.BuildLogger.Println("Not using umask - FF_DISABLE_UMASK_FOR_DOCKER_EXECUTOR is set!")
+	}
+
+	return nil
+}
+
+func (s *commandExecutor) isUmaskDisabled() bool {
+	// Not usable with docker-windows executor
+	if s.info.OSType == osTypeWindows {
+		return false
+	}
+
+	if !s.Build.IsFeatureFlagOn(featureflags.DisableUmaskForDockerExecutor) {
+		return false
+	}
+
+	return true
+}
+
+func (s *commandExecutor) Run(cmd common.ExecutorCommand) error {
+	if cmd.Predefined {
+		return s.runContainer(predefinedContainerType, cmd)
+	} else {
+		return s.runContainer(buildContainerType, cmd)
+	}
+}
+
+func (s *commandExecutor) runContainer(containerType string, cmd common.ExecutorCommand) error {
+	maxAttempts := s.Build.GetExecutorJobSectionAttempts()
+
+	var runErr error
+	for attempts := 1; attempts <= maxAttempts; attempts++ {
+		if attempts > 1 {
+			s.BuildLogger.Infoln(fmt.Sprintf("Retrying %s", cmd.Stage))
+		}
+
+		ctr, err := s.requestContainer(containerType)
+		if err != nil {
+			return err
+		}
+
+		s.BuildLogger.Debugln("Executing on", ctr.Name, "the", cmd.Script)
+		s.SetCurrentStage(ExecutorStageRun)
+
+		runErr = s.startAndWatchContainer(cmd.Context, ctr.ID, bytes.NewBufferString(cmd.Script))
+		if !docker.IsErrNotFound(runErr) {
+			return runErr
+		}
+
+		s.BuildLogger.Errorln(fmt.Sprintf("Container %q not found or removed. Will retry...", ctr.ID))
+	}
+
+	if runErr != nil && maxAttempts > 1 {
+		s.BuildLogger.Errorln("Execution attempts exceeded")
+	}
+
+	return runErr
+}
+
+func (s *commandExecutor) requestContainer(containerType string) (*container.InspectResponse, error) {
+	switch containerType {
+	case buildContainerType:
+		return s.requestBuildContainer()
+	case predefinedContainerType:
+		return s.requestHelperContainer()
+	default:
+		return nil, fmt.Errorf("invalid container-type %q", containerType)
+	}
+}
+
+func (s *commandExecutor) hasExistingContainer(containerType string, container *container.InspectResponse) bool {
+	if container == nil {
+		return false
+	}
+
+	_, err := s.dockerConn.ContainerInspect(s.Context, container.ID)
+	if err == nil {
+		return true
+	}
+
+	if docker.IsErrNotFound(err) {
+		return false
+	}
+
+	s.BuildLogger.Warningln("Failed to inspect", containerType, "container", container.ID, err.Error())
+
+	return false
+}
+
+func (s *commandExecutor) requestHelperContainer() (*container.InspectResponse, error) {
+	if s.hasExistingContainer(predefinedContainerType, s.helperContainer) {
+		return s.helperContainer, nil
+	}
+
+	prebuildImage, err := s.getHelperImage()
+	if err != nil {
+		return nil, err
+	}
+
+	buildImage := spec.Image{
+		Name: prebuildImage.ID,
+	}
+
+	s.helperContainer, err = s.createContainer(
+		predefinedContainerType,
+		buildImage,
+		[]string{prebuildImage.ID},
+		newDefaultContainerConfigurator(&s.executor, predefinedContainerType, buildImage, s.getHelperImageCmd(), []string{prebuildImage.ID}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := s.Build.ExecutorData.(*executorData); ok {
+		data.ContainerName = s.helperContainer.Name
+	}
+
+	return s.helperContainer, nil
+}
+
+func (s *commandExecutor) getHelperImageCmd() []string {
+	if s.isUmaskDisabled() {
+		if s.Config.IsProxyExec() {
+			return []string{"gitlab-runner-helper", "proxy-exec", "--bootstrap", "/bin/bash"}
+		}
+		return []string{"/bin/bash"}
+	}
+
+	return s.helperImageInfo.Cmd
+}
+
+func (s *commandExecutor) requestBuildContainer() (*container.InspectResponse, error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.hasExistingContainer(buildContainerType, s.buildContainer) {
+		return s.buildContainer, nil
+	}
+
+	var err error
+	s.buildContainer, err = s.createContainer(
+		buildContainerType,
+		s.Build.Image,
+		[]string{},
+		newDefaultContainerConfigurator(&s.executor, buildContainerType, s.Build.Image, s.BuildShell.DockerCommand, []string{}),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if data, ok := s.Build.ExecutorData.(*executorData); ok {
+		data.ContainerName = s.buildContainer.Name
+	}
+
+	if s.Build.IsFeatureFlagOn(featureflags.UseConcrete) {
+		return s.buildContainer, nil
+	}
+
+	err = s.changeFilesOwnership()
+	if err != nil {
+		return nil, err
+	}
+
+	return s.buildContainer, nil
+}
+
+func (s *commandExecutor) Suspend(ctx context.Context) (url.Values, error) {
+	if s.buildContainerID == "" {
+		return nil, errors.New("no build container to suspend")
+	}
+	if s.helperContainer == nil {
+		return nil, errors.New("no helper container to suspend")
+	}
+
+	g, gctx := errgroup.WithContext(ctx)
+
+	g.Go(func() error {
+		if err := s.dockerConn.ContainerStop(gctx, s.buildContainerID, client.ContainerStopOptions{}); err != nil {
+			return fmt.Errorf("stopping build container %s: %w", s.buildContainerID, err)
+		}
+		return nil
+	})
+
+	g.Go(func() error {
+		if err := s.dockerConn.ContainerStop(gctx, s.helperContainer.ID, client.ContainerStopOptions{}); err != nil {
+			return fmt.Errorf("stopping helper container %s: %w", s.helperContainer.ID, err)
+		}
+		return nil
+	})
+
+	for _, svc := range s.services {
+		svcID := svc.ID
+		g.Go(func() error {
+			if err := s.dockerConn.ContainerStop(gctx, svcID, client.ContainerStopOptions{}); err != nil {
+				return fmt.Errorf("stopping service container %s: %w", svcID, err)
+			}
+			return nil
+		})
+	}
+
+	// Suspend is all-or-nothing: if any stop fails, the job fails and
+	// Cleanup removes all containers. A partially-stopped environment
+	// is not recoverable via retry.
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	s.suspended = true
+
+	serviceIDs := make([]string, 0, len(s.services))
+	for _, svc := range s.services {
+		serviceIDs = append(serviceIDs, svc.ID)
+	}
+	return envKeyFields{
+		buildContainerID:    s.buildContainerID,
+		helperContainerID:   s.helperContainer.ID,
+		serviceContainerIDs: serviceIDs,
+	}.toValues(), nil
+}
+
+// Resume is a no-op: by the time it runs, Prepare has already resumed the
+// environment and cached the build and helper container inspects on the executor.
+func (s *commandExecutor) Resume(_ context.Context, _ url.Values) error {
+	return nil
+}
+
+func (s *commandExecutor) changeFilesOwnership() error {
+	if !s.isUmaskDisabled() {
+		return nil
+	}
+
+	dockerExec := exec.NewDocker(s.Context, s.dockerConn, s.waiter, s.Build.Log())
+	inspect := user.NewInspect(s.dockerConn, dockerExec)
+	imageSHA := s.buildContainer.Image
+	imageName := s.Build.Image.Name
+
+	log := s.Build.Log().WithFields(logrus.Fields{
+		"imageSHA":  imageSHA,
+		"imageName": imageName,
+	})
+	log.Debug("Checking if image runs with root user")
+
+	usesRoot, err := inspect.IsRoot(s.Context, imageSHA)
+	if err != nil {
+		return fmt.Errorf("checking if image %q runs as root: %w", imageName, err)
+	}
+
+	if usesRoot {
+		log.Debug("Image uses root user")
+		return nil
+	}
+
+	log.Debug("Image doesn't use root user")
+
+	uid, gid, err := getUIDandGID(s.Context, log, inspect, s.buildContainer.ID, imageSHA)
+	if err != nil {
+		return err
+	}
+
+	if uid == 0 {
+		return nil
+	}
+
+	return s.executeChown(dockerExec, uid, gid)
+}
+
+func getUIDandGID(
+	ctx context.Context,
+	log logrus.FieldLogger,
+	inspect user.Inspect,
+	buildContainerID string,
+	imageSHA string,
+) (int, int, error) {
+	containerLog := log.WithField("container", buildContainerID)
+	containerLog.Debug("Getting the UID of the container")
+
+	uid, err := inspect.UID(ctx, buildContainerID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("checking %q image UID: %w", imageSHA, err)
+	}
+
+	containerLog.Debugf("Container UID=%d", uid)
+	containerLog.Debug("Getting the GID of the container")
+
+	gid, err := inspect.GID(ctx, buildContainerID)
+	if err != nil {
+		return 0, 0, fmt.Errorf("checking %q image GID: %w", imageSHA, err)
+	}
+
+	containerLog.Debugf("Container GID=%d", gid)
+
+	return uid, gid, err
+}
+
+func (s *commandExecutor) executeChown(dockerExec exec.Docker, uid int, gid int) error {
+	c, err := s.requestHelperContainer()
+	if err != nil {
+		return fmt.Errorf("requesting new predefined container: %w", err)
+	}
+
+	// The builds directory is normally backed by a volume unique to this
+	// runner, project and concurrency slot, so changing ownership of all of
+	// it gives the build user a writable workspace around the checkout
+	// without affecting anything else. A shared builds directory can contain
+	// trees belonging to other projects and to concurrently running jobs,
+	// potentially using different UIDs, so there the ownership changes are
+	// limited to the directories set aside for use by this job alone.
+	if !s.SharedBuildsDir {
+		return s.executeChownOnDir(c, dockerExec, uid, gid, helpers.ToSlash(s.Build.RootDir))
+	}
+
+	err = s.executeChownOnDir(c, dockerExec, uid, gid, s.Build.FullProjectDir())
+	if err != nil {
+		return err
+	}
+
+	return s.executeChownOnDir(c, dockerExec, uid, gid, s.Build.TmpProjectDir())
+}
+
+func (s *commandExecutor) executeChownOnDir(
+	c *container.InspectResponse,
+	dockerExec exec.Docker,
+	uid int,
+	gid int,
+	dir string,
+) error {
+	s.BuildLogger.Println(fmt.Sprintf("Changing ownership of files at %q to %d:%d", dir, uid, gid))
+
+	output := new(bytes.Buffer)
+	// limit how much data we read from the container log to
+	// avoid memory exhaustion
+	lw := limitwriter.New(output, 1024)
+	streams := exec.IOStreams{
+		Stdin:  strings.NewReader(fmt.Sprintf("chown -RP -- %d:%d %q", uid, gid, dir)),
+		Stderr: lw,
+		Stdout: lw,
+	}
+
+	err := dockerExec.Exec(s.Context, c.ID, streams, nil)
+
+	log := s.Build.Log().WithField("updatedDir", dir)
+	log.WithField("output", output.String()).Debug("Changing ownership of files")
+
+	if err != nil {
+		log.WithError(err).Error("Failed to change ownership of files")
+	}
+
+	return nil
+}
+
+func (s *commandExecutor) GetMetricsSelector() string {
+	return fmt.Sprintf("instance=%q", s.executor.info.Name)
+}
+
+func newDockerOptions() executors.ExecutorOptions {
+	return executors.ExecutorOptions{
+		DefaultCustomBuildsDirEnabled: true,
+		DefaultSafeDirectoryCheckout:  true,
+		DefaultBuildsDir:              "/builds",
+		DefaultCacheDir:               "/cache",
+		SharedBuildsDir:               false,
+		Shell: common.ShellScriptInfo{
+			Shell:         "bash",
+			Type:          common.NormalShell,
+			RunnerCommand: "/usr/bin/gitlab-runner-helper",
+		},
+		ShowHostname: true,
+	}
+}
+
+func newDockerCreator(options executors.ExecutorOptions) func() common.Executor {
+	return func() common.Executor {
+		e := &commandExecutor{
+			executor: executor{
+				AbstractExecutor: executors.AbstractExecutor{
+					ExecutorOptions: options,
+				},
+			},
+		}
+
+		e.SetCurrentStage(common.ExecutorStageCreated)
+		return e
+	}
+}
+
+func dockerFeaturesUpdater(features *common.FeaturesInfo) {
+	features.Image = true
+	features.ImageExecutorOpts = true
+	features.NativeStepsIntegration = true
+	features.ServiceExecutorOpts = true
+	features.ServiceMultipleAliases = true
+	features.ServiceVariables = true
+	features.Services = true
+	features.Session = true
+	features.Terminal = true
+	features.Variables = true
+}
+
+func NewProvider() common.ExecutorProvider {
+	options := newDockerOptions()
+	return executorProvider{
+		DefaultExecutorProvider: executors.DefaultExecutorProvider{
+			Creator:          newDockerCreator(options),
+			FeaturesUpdater:  dockerFeaturesUpdater,
+			ConfigUpdater:    configUpdater,
+			DefaultShellName: options.Shell.Shell,
+		},
+	}
+}
+
+func NewWindowsProvider() common.ExecutorProvider {
+	options := newDockerOptions()
+	windowsFeaturesUpdater := func(features *common.FeaturesInfo) {
+		dockerFeaturesUpdater(features)
+		features.NativeStepsIntegration = false
+	}
+	return executorProvider{
+		DefaultExecutorProvider: executors.DefaultExecutorProvider{
+			Creator:          newDockerCreator(options),
+			FeaturesUpdater:  windowsFeaturesUpdater,
+			ConfigUpdater:    configUpdater,
+			DefaultShellName: options.Shell.Shell,
+		},
+	}
+}

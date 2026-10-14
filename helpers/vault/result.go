@@ -1,0 +1,40 @@
+package vault
+
+import (
+	"errors"
+
+	"github.com/openbao/openbao/api/v2"
+)
+
+type Result interface {
+	Data() map[string]any
+	TokenID() (string, error)
+}
+
+var ErrNoResult = errors.New("no result from Vault")
+
+type secretResult struct {
+	inner *api.Secret
+}
+
+func newResult(secret *api.Secret) Result {
+	return &secretResult{
+		inner: secret,
+	}
+}
+
+func (r *secretResult) Data() map[string]any {
+	if r.inner == nil {
+		return nil
+	}
+
+	return r.inner.Data
+}
+
+func (r *secretResult) TokenID() (string, error) {
+	if r.inner == nil {
+		return "", ErrNoResult
+	}
+
+	return r.inner.TokenID()
+}

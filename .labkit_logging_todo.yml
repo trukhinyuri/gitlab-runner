@@ -1,0 +1,45 @@
+# LabKit Logging Field Standardization TODO
+# AUTO-GENERATED FILE. DO NOT EDIT MANUALLY.
+#
+# This file tracks deprecated logging fields that need to be migrated to
+# standard fields defined in gitlab.com/gitlab-org/labkit/v2/fields.
+# Each offense represents a file using a deprecated field name.
+#
+# How to fix:
+#   Replace the string literal with the constant from the fields package.
+#   e.g. log.WithField("source_ip", ...) → log.WithField(fields.RemoteIP, ...)
+#
+# Adding offenses when an immediate fix is not possible:
+#   go get gitlab.com/gitlab-org/labkit/v2/cmd/validate-log-fields
+#   go run gitlab.com/gitlab-org/labkit/v2/cmd/validate-log-fields -update-todo
+#   go mod tidy
+#
+# Regenerate entire TODO:
+#   Delete this file, then run the command above.
+
+---
+offenses:
+    - callsite: commands/multi.go
+      deprecated_field: organization_id
+      standard_field: fields.GitLabOrganizationID
+    - callsite: common/build.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: common/build.go
+      deprecated_field: organization_id
+      standard_field: fields.GitLabOrganizationID
+    - callsite: executors/docker/docker.go
+      deprecated_field: error
+      standard_field: fields.ErrorMessage
+    - callsite: executors/docker/machine/details.go
+      deprecated_field: reason
+      standard_field: fields.LogMessage
+    - callsite: executors/docker/machine/provider.go
+      deprecated_field: duration
+      standard_field: fields.DurationS
+    - callsite: executors/kubernetes/autoscaler/pause_pod_manager.go
+      deprecated_field: component
+      standard_field: fields.ServiceName
+    - callsite: network/retry_requester.go
+      deprecated_field: duration
+      standard_field: fields.DurationS

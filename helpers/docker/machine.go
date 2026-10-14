@@ -1,0 +1,64 @@
+package docker
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/sirupsen/logrus"
+)
+
+// ErrLabelsNotSupported mirrors the docker-machine error for drivers
+// without label support, recovered from the command output since
+// docker-machine is a subprocess.
+var ErrLabelsNotSupported = errors.New("driver does not support labels")
+
+type LogEntry struct {
+	Time   time.Time
+	Level  logrus.Level
+	Msg    string
+	Fields map[string]any
+}
+
+// JSONLogFormat needs Docker Machine 0.16.2-gitlab.55 or later.
+type MachineOutput struct {
+	JSONLogFormat bool
+	OnEntry       func(LogEntry)
+}
+
+type Machine interface {
+	Create(ctx context.Context, driver, name string, output MachineOutput, opts ...string) error
+	Provision(ctx context.Context, name string) error
+	Remove(ctx context.Context, name string) error
+	ForceRemove(ctx context.Context, name string) error
+	Stop(ctx context.Context, name string) error
+	List() (machines []string, err error)
+	Exist(ctx context.Context, name string) bool
+
+	CanConnect(ctx context.Context, name string, skipCache bool) bool
+	Credentials(ctx context.Context, name string) (Credentials, error)
+
+	// UpdateLabels merges provider-side labels into an existing machine.
+	// Returns ErrLabelsNotSupported when the driver has no label concept.
+	UpdateLabels(ctx context.Context, name string, labels map[string]string) error
+
+	// Inspect returns selected fields from the per-machine state file
+	// docker-machine writes during Create. Used to label autoscaling
+	// metrics with what was actually provisioned (zone the regional
+	// MIG placed in, machine type Flex MIG selected) rather than
+	// operator-supplied static values that may drift from reality.
+	// Best-effort: missing or malformed state returns empty info + err.
+	Inspect(name string) (MachineInfo, error)
+}
+
+// MachineInfo carries the subset of docker-machine driver state read
+// off disk for metric labels. Driver-specific fields (Zone, MachineType,
+// Project) are only populated when DriverName has an explicit schema —
+// currently just "google". Other drivers get DriverName only; we'd
+// rather emit empty labels than surface uninterpretable values.
+type MachineInfo struct {
+	DriverName  string
+	Zone        string
+	MachineType string
+	Project     string
+}

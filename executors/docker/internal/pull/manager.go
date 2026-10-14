@@ -1,0 +1,511 @@
+package pull
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/containerd/platforms"
+	cli "github.com/docker/cli/cli/config/types"
+	"github.com/hashicorp/go-version"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker/auth"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/pull_policies"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/retry"
+)
+
+const (
+	// defaultPullMaxAttempts bounds how many times a single pull-policy attempt
+	// retries the underlying docker pull when it fails with a transient
+	// (network/registry) error. Non-transient failures (missing image, auth
+	// denied) are not retried.
+	defaultPullMaxAttempts     = 3
+	defaultPullRetryMinBackoff = 2 * time.Second
+	defaultPullRetryMaxBackoff = 10 * time.Second
+)
+
+// minPlatformAwareInspectAPIVersion is the moby/moby SDK's own version gate for
+// the image-inspect "platform" parameter; daemons below it reject the
+// request outright (e.g. Podman, which tops out at 1.41).
+var minPlatformAwareInspectAPIVersion = version.Must(version.NewVersion("1.49"))
+
+type Manager interface {
+	GetDockerImage(imageName string, options spec.ImageDockerOptions, imagePullPolicies []common.DockerPullPolicy,
+	) (*image.InspectResponse, error)
+}
+
+type ManagerConfig struct {
+	DockerConfig *common.DockerConfig
+	AuthConfig   string
+	ShellUser    string
+	Credentials  []spec.Credentials
+
+	// AllowedCredentialHelpers gates which docker credential helpers the
+	// job-supplied AuthConfig can execute. See
+	// RunnerSettings.AllowedDockerCredentialHelpers.
+	AllowedCredentialHelpers map[string][]string
+
+	// APIVersion is the Docker daemon's API version, already known to the
+	// executor from connecting.
+	APIVersion *version.Version
+}
+
+type pullLogger interface {
+	Debugln(args ...any)
+	Infoln(args ...any)
+	Warningln(args ...any)
+	Println(args ...any)
+}
+
+type manager struct {
+	usedImages     map[string]string
+	usedImagesLock sync.Mutex
+
+	context             context.Context
+	config              ManagerConfig
+	client              docker.Client
+	onPullImageHookFunc func()
+
+	pullMaxAttempts     int
+	pullRetryMinBackoff time.Duration
+	pullRetryMaxBackoff time.Duration
+
+	logger pullLogger
+}
+
+// ManagerOption customizes a Manager built by NewManager. There is
+// currently no production caller that needs one; it exists as a test seam
+// so tests can override retry timing without depending on the unexported
+// manager type or the production defaults below.
+type ManagerOption func(*manager)
+
+// WithPullRetryConfig overrides the image-pull retry attempt count and
+// jittered backoff window that shouldRetryImagePull and pullDockerImage use.
+func WithPullRetryConfig(maxAttempts int, minBackoff, maxBackoff time.Duration) ManagerOption {
+	return func(m *manager) {
+		m.pullMaxAttempts = maxAttempts
+		m.pullRetryMinBackoff = minBackoff
+		m.pullRetryMaxBackoff = maxBackoff
+	}
+}
+
+func NewManager(
+	ctx context.Context,
+	logger pullLogger,
+	config ManagerConfig,
+	client docker.Client,
+	onPullImageHookFunc func(),
+	opts ...ManagerOption,
+) Manager {
+	m := &manager{
+		context:             ctx,
+		client:              client,
+		config:              config,
+		logger:              logger,
+		onPullImageHookFunc: onPullImageHookFunc,
+		pullMaxAttempts:     defaultPullMaxAttempts,
+		pullRetryMinBackoff: defaultPullRetryMinBackoff,
+		pullRetryMaxBackoff: defaultPullRetryMaxBackoff,
+	}
+
+	for _, opt := range opts {
+		opt(m)
+	}
+
+	return m
+}
+
+func (m *manager) GetDockerImage(
+	imageName string, options spec.ImageDockerOptions,
+	imagePullPolicies []common.DockerPullPolicy,
+) (*image.InspectResponse, error) {
+	pullPolicies, err := m.getPullPolicies(imagePullPolicies)
+	if err != nil {
+		return nil, err
+	}
+
+	allowedPullPolicies, err := m.config.DockerConfig.GetAllowedPullPolicies()
+	if err != nil {
+		return nil, err
+	}
+
+	pullPolicies, err = pull_policies.ComputeEffectivePullPolicies(
+		pullPolicies, allowedPullPolicies, imagePullPolicies, m.config.DockerConfig.PullPolicy)
+	if err != nil {
+		return nil, &common.BuildError{
+			Inner:         fmt.Errorf("invalid pull policy for image %q: %w", imageName, err),
+			FailureReason: common.ConfigurationError,
+		}
+	}
+
+	m.logger.Println(fmt.Sprintf("Using effective pull policy of %s for container %s", pullPolicies, imageName))
+
+	// Parsed once rather than per pull policy, so its warning isn't repeated.
+	platform, err := ParsePlatform(options.Platform, m.logger)
+	if err != nil {
+		return nil, &common.BuildError{Inner: err, FailureReason: common.ConfigurationError}
+	}
+
+	var imageErr error
+	for idx, pullPolicy := range pullPolicies {
+		attempt := 1 + idx
+		if attempt > 1 {
+			m.logger.Infoln(fmt.Sprintf("Attempt #%d: Trying %q pull policy", attempt, pullPolicy))
+		}
+
+		var img *image.InspectResponse
+		img, imageErr = m.getImageUsingPullPolicy(imageName, options, platform, pullPolicy)
+		if imageErr != nil {
+			m.logger.Warningln(fmt.Sprintf("Failed to pull image with policy %q: %v", pullPolicy, imageErr))
+			continue
+		}
+
+		m.markImageAsUsed(imageName, img)
+
+		return img, nil
+	}
+
+	return nil, fmt.Errorf(
+		"failed to pull image %q with specified policies %v: %w",
+		imageName,
+		pullPolicies,
+		imageErr,
+	)
+}
+
+func (m *manager) wasImageUsed(imageName, imageID string) bool {
+	m.usedImagesLock.Lock()
+	defer m.usedImagesLock.Unlock()
+
+	return m.usedImages[imageName] == imageID
+}
+
+func (m *manager) markImageAsUsed(imageName string, image *image.InspectResponse) {
+	m.usedImagesLock.Lock()
+	defer m.usedImagesLock.Unlock()
+
+	if m.usedImages == nil {
+		m.usedImages = make(map[string]string)
+	}
+	m.usedImages[imageName] = image.ID
+
+	if imageName == image.ID {
+		return
+	}
+
+	if len(image.RepoDigests) > 0 {
+		m.logger.Println("Using docker image", image.ID, "for", imageName, "with digest", image.RepoDigests[0], "...")
+	} else {
+		m.logger.Println("Using docker image", image.ID, "for", imageName, "...")
+	}
+}
+
+// ParsePlatform converts a platform string (e.g. "linux/arm64") into an OCI
+// platform spec, or nil if none was given. A nil logger skips the warning
+// about a normalized OS, for callers parsing a platform already warned about.
+// Exported so the docker executor can reuse it too.
+func ParsePlatform(rawPlatform string, logger pullLogger) (*ocispec.Platform, error) {
+	if rawPlatform == "" {
+		return nil, nil
+	}
+
+	platform, err := platforms.Parse(rawPlatform)
+	if err != nil {
+		return nil, err
+	}
+
+	if normalized := normalizeContainerOS(platform.OS); normalized != platform.OS {
+		if logger != nil {
+			logger.Warningln(fmt.Sprintf(
+				"Platform OS %q in %q is not a valid container OS; using %q instead",
+				platform.OS, rawPlatform, normalized,
+			))
+		}
+		platform.OS = normalized
+	}
+
+	return &platform, nil
+}
+
+// PlatformMatchesImage treats a component the request left empty as matching
+// anything, since it asks for no particular value. Exported so the docker
+// executor can reuse it too.
+func PlatformMatchesImage(platform *ocispec.Platform, image *image.InspectResponse) bool {
+	if platform.OS != image.Os || platform.Architecture != image.Architecture {
+		return false
+	}
+	if platform.Variant != "" && platform.Variant != image.Variant {
+		return false
+	}
+	if platform.OSVersion != "" && platform.OSVersion != image.OsVersion {
+		return false
+	}
+
+	return true
+}
+
+// FormatImagePlatform formats image's platform as an "os/arch[/variant]"
+// specifier. Exported so the docker executor can reuse it too.
+func FormatImagePlatform(image *image.InspectResponse) string {
+	return platforms.FormatAll(ocispec.Platform{
+		Architecture: image.Architecture,
+		OS:           image.Os,
+		OSVersion:    image.OsVersion,
+		Variant:      image.Variant,
+	})
+}
+
+// normalizeContainerOS corrects a quirk of platforms.Parse: given a bare,
+// unqualified architecture string (e.g. "arm64", with no "linux/" or
+// "windows/" prefix), it fills in the missing OS component using the host
+// machine's own OS (runtime.GOOS) rather than a container OS. That's right
+// for a Linux or Windows runner host, since those are also valid container
+// OSes, but wrong anywhere else -- most notably macOS, which GitLab Runner
+// officially supports as a host but which never runs native containers.
+// Only linux and windows container images exist, so anything else must
+// have leaked in from a non-container host OS and should target linux.
+func normalizeContainerOS(os string) string {
+	if os != "linux" && os != "windows" {
+		return "linux"
+	}
+	return os
+}
+
+// inspectOptions requests a platform-aware inspect, falling back to a
+// platform-agnostic one below minPlatformAwareInspectAPIVersion.
+func (m *manager) inspectOptions(imageName string, platform *ocispec.Platform) []client.ImageInspectOption {
+	if platform == nil {
+		return nil
+	}
+
+	if m.config.APIVersion != nil && m.config.APIVersion.LessThan(minPlatformAwareInspectAPIVersion) {
+		m.logger.Debugln(fmt.Sprintf(
+			"Docker daemon API version %s does not support platform-aware image inspection "+
+				"(requires %s or later); falling back to inspecting %q without a platform filter",
+			m.config.APIVersion, minPlatformAwareInspectAPIVersion, imageName,
+		))
+		return nil
+	}
+
+	return []client.ImageInspectOption{client.ImageInspectWithPlatform(platform)}
+}
+
+func (m *manager) getImageUsingPullPolicy(
+	imageName string, options spec.ImageDockerOptions, platform *ocispec.Platform,
+	pullPolicy common.DockerPullPolicy,
+) (*image.InspectResponse, error) {
+	m.logger.Debugln("Looking for image", imageName, "...")
+
+	inspectOptions := m.inspectOptions(imageName, platform)
+	existingImage, _, err := m.client.ImageInspectWithRaw(m.context, imageName, inspectOptions...)
+
+	// A platform-aware inspect only finds an image for the requested platform.
+	// Without one (below minPlatformAwareInspectAPIVersion), the local image
+	// can be another platform's, and reusing it would run the job on that one.
+	wrongPlatform := err == nil && platform != nil && len(inspectOptions) == 0 &&
+		!PlatformMatchesImage(platform, &existingImage)
+
+	// Return early if we already used that image
+	if err == nil && !wrongPlatform && m.wasImageUsed(imageName, existingImage.ID) {
+		return &existingImage, nil
+	}
+
+	// If never is specified then we return what inspect did return
+	if pullPolicy == common.PullPolicyNever {
+		return &existingImage, err
+	}
+
+	if err == nil {
+		// Don't pull image that is passed by ID
+		if existingImage.ID == imageName {
+			return &existingImage, nil
+		}
+
+		// If not-present is specified
+		if pullPolicy == common.PullPolicyIfNotPresent {
+			if !wrongPlatform {
+				m.logger.Println(fmt.Sprintf("Using locally found image version due to %q pull policy", pullPolicy))
+				return &existingImage, err
+			}
+
+			m.logger.Println(fmt.Sprintf(
+				"Locally found image is for platform %s, not the requested %q; pulling it despite %q pull policy",
+				FormatImagePlatform(&existingImage), options.Platform, pullPolicy,
+			))
+		}
+	}
+
+	authConfig, err := m.resolveAuthConfigForImage(imageName)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.pullDockerImage(imageName, options, authConfig, platform)
+}
+
+func (m *manager) resolveAuthConfigForImage(imageName string) (*cli.AuthConfig, error) {
+	registryInfo, err := auth.NewResolver(m.config.AllowedCredentialHelpers).ConfigForImage(
+		imageName,
+		m.config.AuthConfig,
+		m.config.ShellUser,
+		m.config.Credentials,
+		m.logger,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if registryInfo == nil {
+		m.logger.Debugln(fmt.Sprintf("No credentials found for %v", imageName))
+		return nil, nil
+	}
+
+	authConfig := &registryInfo.AuthConfig
+	m.logger.Println(fmt.Sprintf("Authenticating with credentials from %v", registryInfo.Source))
+	m.logger.Debugln(fmt.Sprintf(
+		"Using %v to connect to %v in order to resolve %v...",
+		authConfig.Username,
+		authConfig.ServerAddress,
+		imageName,
+	))
+	return authConfig, nil
+}
+
+func (m *manager) pullDockerImage(
+	imageName string, options spec.ImageDockerOptions, ac *cli.AuthConfig, platform *ocispec.Platform,
+) (*image.InspectResponse, error) {
+	if m.onPullImageHookFunc != nil {
+		m.onPullImageHookFunc()
+	}
+	msg := "Pulling docker image %s ..."
+	if options.Platform == "" {
+		msg = fmt.Sprintf(msg, imageName)
+	} else {
+		msg = fmt.Sprintf(msg, imageName+" for platform "+options.Platform)
+	}
+	m.logger.Println(msg)
+
+	ref := imageName
+	// Add :latest to limit the download results
+	if !strings.ContainsAny(ref, ":@") {
+		ref += ":latest"
+	}
+
+	opts := client.ImagePullOptions{}
+	if platform != nil {
+		opts.Platforms = []ocispec.Platform{*platform}
+	}
+
+	var err error
+
+	if opts.RegistryAuth, err = auth.EncodeConfig(ac); err != nil {
+		return nil, &common.BuildError{Inner: err, FailureReason: common.RunnerSystemFailure}
+	}
+
+	// Retry the pull on transient (network/registry) failures such as HTTP
+	// client timeouts talking to the registry auth endpoint. Non-transient
+	// failures (missing image, auth denied) are returned immediately so they
+	// still fail fast and fall through to the next configured pull policy. A
+	// cancelled or timed-out build context is classified inside the run func
+	// below and is never retried, so the loop stops on cancellation.
+	pullErr := retry.NewNoValue(
+		retry.New().
+			WithBackoff(m.pullRetryMinBackoff, m.pullRetryMaxBackoff).
+			WithBackoffJitter().
+			WithCheck(func(tries int, err error) bool {
+				return m.shouldRetryImagePull(imageName, tries, err)
+			}),
+		func() error {
+			return m.imagePullOnce(ref, opts)
+		},
+	).Run()
+	if pullErr != nil {
+		return nil, pullErr
+	}
+
+	image, _, err := m.client.ImageInspectWithRaw(m.context, imageName, m.inspectOptions(imageName, platform)...)
+	if err != nil {
+		if cancelErr := contextCancellationBuildError(m.context); cancelErr != nil {
+			return nil, cancelErr
+		}
+		return nil, &common.BuildError{
+			Inner:         fmt.Errorf("inspecting image %q after pull: %w", imageName, err),
+			FailureReason: common.ClassifyImagePullFailure(err.Error()),
+		}
+	}
+	return &image, nil
+}
+
+// shouldRetryImagePull decides whether a failed pull attempt should be retried.
+// Only transient (network/registry) failures are retried, and only up to
+// pullMaxAttempts; missing-image, auth-denied and cancellation failures are not.
+func (m *manager) shouldRetryImagePull(imageName string, tries int, err error) bool {
+	var buildErr *common.BuildError
+	if tries >= m.pullMaxAttempts ||
+		!errors.As(err, &buildErr) ||
+		buildErr.FailureReason != common.RunnerExternalDependencyFailure {
+		return false
+	}
+
+	m.logger.Warningln(fmt.Sprintf(
+		"Failed to pull image %q (attempt #%d), retrying: %v", imageName, tries, err))
+	return true
+}
+
+// imagePullOnce performs a single docker pull and classifies any failure. A
+// cancelled or timed-out build context must not be misclassified as an
+// image-pull failure (and must not be retried), so surface the cancellation
+// reason directly.
+func (m *manager) imagePullOnce(ref string, opts client.ImagePullOptions) error {
+	if err := m.client.ImagePullBlocking(m.context, ref, opts); err != nil {
+		if cancelErr := contextCancellationBuildError(m.context); cancelErr != nil {
+			return cancelErr
+		}
+		return &common.BuildError{Inner: err, FailureReason: common.ClassifyImagePullFailure(err.Error())}
+	}
+	return nil
+}
+
+// contextCancellationBuildError returns a BuildError describing the cancellation
+// if ctx has been canceled or its deadline exceeded; otherwise it returns nil.
+// This mirrors the semantics of (*Build).runtimeStateAndError so deep call sites
+// don't misclassify cancellations as image-pull or system failures.
+//
+// Both ctx.Err() and context.Cause(ctx) are checked for DeadlineExceeded so
+// that a deadline created with context.WithDeadlineCause is still classified
+// as a timeout even when its custom cause does not wrap context.DeadlineExceeded.
+func contextCancellationBuildError(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	cause := context.Cause(ctx)
+	if errors.Is(cause, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return &common.BuildError{
+			Inner:         cause,
+			FailureReason: common.JobExecutionTimeout,
+		}
+	}
+	return &common.BuildError{
+		Inner:         common.ErrJobCanceled,
+		FailureReason: common.JobCanceled,
+	}
+}
+
+// getPullPolicies selects the pull_policy configurations originating from
+// either gitlab-ci.yaml or config.toml. If present, the pull_policies in
+// gitlab-ci.yaml take precedence over those in config.toml.
+func (m *manager) getPullPolicies(imagePullPolicies []common.DockerPullPolicy) ([]common.DockerPullPolicy, error) {
+	if len(imagePullPolicies) != 0 {
+		return imagePullPolicies, nil
+	}
+	return m.config.DockerConfig.GetPullPolicies()
+}

@@ -1,0 +1,359 @@
+---
+stage: Verify
+group: CI Functions Platform
+info: To determine the technical writer assigned to the Stage/Group associated with this page, see <https://handbook.gitlab.com/handbook/product/ux/technical-writing/#assignments>
+title: インスタンスRunnerまたはグループRunnerのRunnerフリートを計画および運用する
+---
+
+共有サービスモデルでRunnerフリートを拡張する場合、これらのベストプラクティスと推奨事項を適用してください。
+
+インスタンスRunnerフリートをホストする場合は、以下を考慮して十分に計画されたインフラストラクチャが必要です。
+
+- コンピューティングキャパシティ。
+- ストレージキャパシティ。
+- ネットワークの帯域幅とスループット。
+- ジョブの種類（プログラミング言語、OSプラットフォーム、依存関係ライブラリなど）。
+
+これらの推奨事項を使用して、組織の要件に基づいたGitLab Runnerのデプロイ戦略を開発してください。
+
+## ワークロードと環境を検討する {#consider-your-workload-and-environment}
+
+Runnerをデプロイする前に、ワークロードと環境の要件を検討してください。
+
+- GitLabにオンボードする予定のチームのリストを作成します。
+- 組織で使用しているプログラミング言語、Webフレームワーク、およびライブラリをカタログ化します。たとえば、Go、C++、PHP、Java、Python、JavaScript、React、Node.jsなどです。
+- 各チームが1日あたり、1時間ごとに実行するCI/CDジョブの数を推定します。
+- いずれかのチームに、コンテナを使用しても対処できないビルド環境要件があるかどうかを検証します。
+- いずれかのチームに、チーム専用のRunnerを用意することで最適に対応できるビルド環境要件があるかどうかを検証します。
+- 予想される需要に対応するために必要なコンピューティングキャパシティを見積もります。
+
+さまざまなRunnerフリートをホストするために、異なるインフラストラクチャスタックを選択できます。たとえば、パブリッククラウドにデプロイすることの必要なRunnerと、オンプレミスにデプロイすることの必要なRunnerがあるかもしれません。
+
+RunnerフリートでのCI/CDジョブのパフォーマンスは、フリートの環境に直接関係しています。大量のリソースを消費するCI/CDジョブを多数実行している場合、共有コンピューティングプラットフォームでRunnerフリートをホスティングすることはお勧めできません。
+
+## Runner、executor、およびオートスケール機能 {#runners-executors-and-autoscaling-capabilities}
+
+`gitlab-runner`実行可能ファイルはCI/CDジョブを実行します。各Runnerは、ジョブ実行のリクエストを取得し、事前定義された設定に従って処理する分離プロセスです。各Runnerは分離プロセスとして、ジョブを実行するための「サブプロセス」（「ワーカー」とも呼ばれる）を作成できます。
+
+### 並行処理数と制限 {#concurrency-and-limit}
+
+- [並行処理数](../configuration/advanced-configuration.md#the-global-section): ホストシステムで設定済みのすべてのRunnerを使用している場合に、同時実行できるジョブの数を設定します。
+- [制限](../configuration/advanced-configuration.md#the-runners-section): Runnerがジョブの同時実行のために作成できるサブプロセスの数を設定します。
+
+この制限は、（Docker MachineやKubernetesのような）オートスケールRunnerと、オートスケールしないRunnerでは異なります。
+
+- オートスケールしないRunnerの場合、`limit`はホストシステムのRunnerのキャパシティを定義します。
+- オートスケールRunnerの場合、`limit`は実行するRunnerの合計数です。
+
+ジョブフローを制御するために`concurrency`、`limit`、および`request_concurrency`がどのように相互作用するかについて詳しくは、[GitLab Runnerの並行処理チューニングに関するKB記事](https://support.gitlab.com/hc/en-us/articles/21324350882076-GitLab-Runner-Concurrency-Tuning-Understanding-request-concurrency)をご覧ください。
+
+### 基本設定: 1つのRunnerマネージャー、1つのRunner {#basic-configuration-one-runner-manager-one-runner}
+
+最も基本的な設定では、サポートされているコンピューティングアーキテクチャとオペレーティングシステムにGitLab Runnerソフトウェアをインストールします。たとえば、Ubuntu Linuxを実行しているx86-64仮想マシン（VM）があるとします。
+
+インストールが完了したら、Runnerの登録コマンドを1回だけ実行し、`shell` executorを選択します。次にRunnerの`config.toml`ファイルを編集して、並行処理数を`1`に設定します。
+
+```toml
+concurrent = 1
+
+[[runners]]
+  name = "instance-level-runner-001"
+  url = ""
+  token = ""
+  executor = "shell"
+```
+
+このRunnerが処理できるGitLab CI/CDジョブは、Runnerをインストールしたホストシステム上で直接実行されます。これは、ターミナルでCI/CDジョブコマンドを自分で実行する場合と同様です。この場合、登録コマンドを実行したのは1回だけなので、`config.toml`ファイルに含まれる`[[runners]]`セクションは1つだけです。並行処理数の値を`1`に設定した場合、1つのRunner「ワーカー」のみがこのシステムのRunnerプロセスでCI/CDジョブを実行できます。
+
+### 中程度の設定: 1つのRunnerマネージャー、複数のRunner {#intermediate-configuration-one-runner-manager-multiple-runners}
+
+同じマシンに複数のRunnerを登録することもできます。このように登録すると、Runnerの`config.toml`ファイルに複数の`[[runners]]`セクションが含まれます。追加のすべてのRunnerワーカーがShell executorを使用している場合に、グローバルの`concurrent`設定の値を`3`に更新すると、ホストは一度に最大3つのジョブを実行できます。
+
+```toml
+concurrent = 3
+
+[[runners]]
+  name = "instance_level_shell_001"
+  url = ""
+  token = ""
+  executor = "shell"
+
+[[runners]]
+  name = "instance_level_shell_002"
+  url = ""
+  token = ""
+  executor = "shell"
+
+[[runners]]
+  name = "instance_level_shell_003"
+  url = ""
+  token = ""
+  executor = "shell"
+
+```
+
+同じマシンに複数のRunnerワーカーを登録でき、各ワーカーは分離プロセスになります。各ワーカーのCI/CDジョブのパフォーマンスは、ホストシステムのコンピューティングキャパシティに依存します。
+
+### オートスケール設定: 1つ以上のRunnerマネージャー、複数のワーカー {#autoscaling-configuration-one-or-more-runner-managers-multiple-workers}
+
+オートスケール用にGitLab Runnerがセットアップされている場合、1つのRunnerが他のRunnerのマネージャーとして機能するように設定できます。これは、`docker-machine` executorまたは`kubernetes` executorで行うことができます。このようなマネージャーのみの設定では、Runnerエージェント自体はCI/CDジョブを実行しません。
+
+#### Docker Machine executor {#docker-machine-executor}
+
+[Docker Machine Executor](../executors/docker_machine.md)を使用する場合、次のようになります。
+
+- Runnerマネージャーは、Dockerを使用してオンデマンドの仮想マシンインスタンスをプロビジョニングします。
+- これらのVMで、GitLab Runnerは、`.gitlab-ci.yml`ファイルに指定されているコンテナイメージを使用して、CI/CDジョブを実行します。
+- さまざまなマシンタイプでCI/CDジョブのパフォーマンスをテストする必要があります。
+- スピードまたはコストに基づいてコンピューティングホストを最適化することを検討する必要があります。
+
+#### Kubernetes executor {#kubernetes-executor}
+
+[Kubernetes executor](../executors/kubernetes/_index.md)を使用する場合、次のようになります。
+
+- Runnerマネージャーが、ターゲットのKubernetesクラスターでポッドをプロビジョニングします。
+- CI/CDジョブは、複数のコンテナで構成される各ポッドで実行されます。
+- ジョブの実行に使用されるポッドは通常、Runnerマネージャーをホストするポッドよりも多くのコンピューティングとメモリリソースを必要とします。
+
+#### Runner設定を再利用する {#reusing-a-runner-configuration}
+
+同じRunner認証トークンに関連付けられている各Runnerマネージャーには、`system_id`識別子が割り当てられます。`system_id`は、Runnerが使用されているマシンを識別します。同じ認証トークンで登録されたRunnerは、一意の`system_id.`によって1つのRunnerエントリにグループ化されます。
+
+類似するRunnerを1つの設定にグループ化すると、Runnerフリートのオペレーションが簡素化されます。
+
+類似するRunnerを1つの設定にグループ化できるシナリオの例を次に示します。
+
+プラットフォーム管理者は、タグ`docker-builds-2vCPU-8GB`を使用して、基盤となる仮想マシンインスタンスサイズ（2 vCPU、8 GB RAM）が同じである複数のRunnerを指定する必要があります。高可用性またはスケーリングのために、このようなRunnerが少なくとも2つ必要です。UIで2つの個別のRunnerエントリを作成する代わりに、管理者は、同じコンピューティングインスタンスサイズを持つすべてのRunnerに対して1つのRunner設定を作成できます。複数のRunnerを登録するために、Runner設定に認証トークンを再利用できます。登録された各Runnerは`docker-builds-2vCPU-8GB`タグを継承します。1つのRunner設定のすべての子Runnerに対して、`system_id`は固有識別子として機能します。
+
+グループにまとめられたRunnerは、複数のRunnerマネージャーによってさまざまなジョブを実行するために再利用できます。
+
+GitLab Runnerは、起動時、または設定の保存時に`system_id`を生成します。`system_id`は、[`config.toml`](../configuration/advanced-configuration.md)と同じディレクトリ内の`.runner_system_id`ファイルに保存され、ジョブログとRunner管理ページに表示されます。
+
+##### `system_id`識別子を生成する {#generating-system_id-identifiers}
+
+GitLab Runnerは`system_id`を生成するために、ハードウェア識別子（一部のLinuxディストリビューションの`/etc/machine-id`など）から一意のシステム識別子を派生しようと試みます。この操作が成功しなかった場合、GitLab Runnerはランダムな識別子を使用して`system_id`を生成します。
+
+`system_id`には、次のいずれかのプレフィックスが付いています。
+
+- `r_`: GitLab Runnerがランダムな識別子を割り当てました。
+- `s_`: GitLab Runnerがハードウェア識別子から一意のシステム識別子を割り当てました。
+
+たとえば、`system_id`がイメージにハードコードされないように、コンテナイメージを作成する際にこの点を考慮することが重要です。`system_id`がハードコードされている場合、特定のジョブを実行しているホストを区別できません。
+
+##### RunnerとRunnerマネージャーを削除する {#delete-runners-and-runner-managers}
+
+Runner登録トークン（非推奨）を使用して登録されたRunnerとRunnerマネージャーを削除するには、`gitlab-runner unregister`コマンドを使用します。
+
+Runner認証トークンを使用して作成されたRunnerとRunnerマネージャーを削除するには、[UI](https://docs.gitlab.com/ci/runners/runners_scope/#delete-instance-runners)または[API](https://docs.gitlab.com/api/runners/#delete-a-runner)を使用します。Runner認証トークンを使用して作成されたRunnerは再利用可能な設定であり、複数のマシンで再利用できます。[`gitlab-runner unregister`](../commands/_index.md#gitlab-runner-unregister)コマンドを使用すると、Runnerマネージャーのみが削除され、Runnerは削除されません。
+
+## インスタンスRunnerを設定する {#configure-instance-runners}
+
+効率的かつ効果的な開始方法は、オートスケール設定（Runnerが「Runnerマネージャー」として機能する設定）でインスタンスRunnerを使用することです。
+
+VMまたはポッドをホストするインフラストラクチャスタックのコンピューティングキャパシティは、以下の条件によって異なります。
+
+- ワークロードと環境を検討する際に特定した要件。
+- Runnerフリートをホストするために使用するテクノロジースタック。
+
+CI/CDワークロードの実行と、経時的なパフォーマンスの分析を開始した後で、場合によってはコンピューティングキャパシティを調整する必要があります。
+
+インスタンスRunnerとオートスケールexecutorを使用する設定では、最小限の2つのRunnerマネージャーで開始する必要があります。
+
+時間の経過とともに必要になるRunnerマネージャーの合計数は、以下の条件によって異なります。
+
+- Runnerマネージャーをホストするスタックのコンピューティングリソース。
+- 各Runnerマネージャーに設定する並行処理数。
+- 各マネージャーが毎時、毎日、毎月実行するCI/CDジョブによって生成される負荷。
+
+たとえばGitLab.comでは、Docker Machine Executorで7つのRunnerマネージャーを実行します。各CI/CDジョブは、Google Cloud Platform（GCP）`n1-standard-1` VMで実行されます。この設定では、毎月数百万件のジョブを処理します。
+
+## Runnerのモニタリング {#monitoring-runners}
+
+大規模なRunnerフリートを運用する上で不可欠なステップは、GitLabに含まれている[Runnerモニタリング](../monitoring/_index.md)機能をセットアップして使用することです。
+
+次の表に、GitLab Runnerメトリクスの概要を示します。このリストには、Go固有のプロセスメトリクスは含まれていません。Runnerでこれらのメトリクスを表示するには、[利用可能なメトリクス](../monitoring/_index.md#available-metrics)に示されているようにコマンドを実行します。
+
+| メトリクス名                                                    | 説明 |
+|----------------------------------------------------------------|-------------|
+| `gitlab_runner_api_request_statuses_total`                     | Runner、エンドポイント、状態に基づいてパーティショニングされたAPIリクエストの総数。 |
+| `gitlab_runner_autoscaling_machine_creation_duration_seconds`  | マシン作成時間のヒストグラム。 |
+| `gitlab_runner_autoscaling_machine_states`                     | このプロバイダーの状態別のマシンの数。 |
+| `gitlab_runner_concurrent`                                     | 同時実行設定の値。 |
+| `gitlab_runner_errors_total`                                   | キャッチされたエラーの数。このメトリクスは、ログの行を追跡するカウンターです。このメトリクスには`level`というラベルが含まれています。使用可能な値は`warning`と`error`です。このメトリクスを含める場合は、監視時に`rate()`または`increase()`を使用してください。つまり、警告またはエラーの発生率が上昇していることが判明した場合には、詳しい調査が必要な問題を示唆している可能性があります。 |
+| `gitlab_runner_jobs`                                           | これにより、（ラベル内のさまざまなスコープで）実行されているジョブの数が表示されます。 |
+| `gitlab_runner_job_duration_seconds`                           | ジョブ期間のヒストグラム。 |
+| `gitlab_runner_job_queue_duration_seconds`                     | ジョブキュー期間を表すヒストグラム。 |
+| `gitlab_runner_acceptable_job_queuing_duration_exceeded_total` | 設定されたキューイング時間のしきい値をジョブが超過する頻度をカウントします。 |
+| `gitlab_runner_job_stage_duration_seconds`                     | 各ステージのジョブ期間を表すヒストグラム。このメトリクスは**高カーディナリティメトリクス**です。詳細については、[高カーディナリティメトリクスのセクション](#high-cardinality-metrics)を参照してください。 |
+| `gitlab_runner_jobs_total`                                     | 実行されたジョブの合計数を表示します。 |
+| `gitlab_runner_job_execution_mode_total`                       | これは、モード（`steps`または`traditional`）およびexecutor別に実行された合計ジョブ数を表示します。 |
+| `gitlab_runner_job_router_circuit_breaker_state`               | Job Routerサーキットブレーカーの状態（`0` = クローズ、`1` = オープン、`2` = ハーフオープン）。 |
+| `gitlab_runner_job_router_circuit_breaker_trips_total`         | Job Routerサーキットブレーカーがトリップして開いた回数。 |
+| `gitlab_runner_limit`                                          | 制限設定の現在の値。 |
+| `gitlab_runner_request_concurrency`                            | 新しいジョブに対する現在の同時リクエストの数。 |
+| `gitlab_runner_request_concurrency_exceeded_total`             | 設定されている`request_concurrency`制限を超える過剰なリクエストの数。 |
+| `gitlab_runner_version_info`                                   | さまざまなビルド統計フィールドでラベル付けされている、定数値`1`を持つメトリクス。 |
+| `process_cpu_seconds_total`                                    | 消費されたユーザーCPU時間とシステムCPU時間の合計（秒単位）。 |
+| `process_max_fds`                                              | オープンファイル記述子の最大数。 |
+| `process_open_fds`                                             | オープンファイル記述子の数。 |
+| `process_resident_memory_bytes`                                | 常駐メモリのサイズ（バイト単位）。 |
+| `process_start_time_seconds`                                   | Unixエポックからの秒数で測定された、プロセスの開始時間。 |
+| `process_virtual_memory_bytes`                                 | 仮想メモリのサイズ（バイト単位）。 |
+| `process_virtual_memory_max_bytes`                             | 利用可能な仮想メモリの最大量（バイト単位）。 |
+
+### Grafanaダッシュボードの設定に関するヒント {#grafana-dashboard-configuration-tips}
+
+この[公開リポジトリ](https://gitlab.com/gitlab-com/runbooks/-/tree/master/dashboards/ci-runners)には、GitLab.comでRunnerフリートを運用するために使用するGrafanaダッシュボードのソースコードがあります。
+
+GitLab.comの多数のメトリクスを追跡しています。クラウドベースのCI/CDの大規模プロバイダーとして、イシューをデバッグできるように、システムをさまざまな観点から把握する必要があります。ほとんどの場合、Self-Managed Runnerフリートは、GitLab.comで追跡している大量のメトリクスを追跡する必要はありません。
+
+#### ダッシュボード生成プロセス {#dashboard-generation-process}
+
+GrafanaはJSON形式のみを受け入れるため、`jsonnet`ファイルをJSONに変換する必要があります。
+
+この[手順書repository](https://gitlab.com/gitlab-com/runbooks/-/tree/master/dashboards)には、GitLabインフラストラクチャ専用の自動化されたスクリプトが含まれています。ご自身の環境用にこれらのダッシュボードを生成するには:
+
+1. `jsonnet`設定言語（`.dashboard.jsonnet`ファイル）を使用してダッシュボードを作成します。
+1. `jsonnet`ファイルを`jsonnet`ライブラリで処理してJSON出力を生成します。
+1. 結果のJSONファイルをGrafanaにアップロードします（APIまたはUIを使用）。
+
+#### 利用可能なRunnerのダッシュボード {#available-runner-dashboards}
+
+ここに、Runnerフリートを監視するために使用すべき、いくつかの重要なダッシュボードがあります:
+
+Runnerで開始されたジョブ:
+
+- 選択した時間間隔にわたってRunnerフリートで実行されたジョブの合計の概要を表示します。
+- 使用状況の傾向を表示します。このダッシュボードは、少なくとも毎週分析する必要があります。
+- このデータをジョブ期間などのメトリクスに関連付けて、CI/CDジョブのパフォーマンスSLOを満たすために、設定の変更が必要かどうか、またはキャパシティのアップグレードが必要かどうかを判断できるようにします。
+
+ジョブ期間:
+
+- Runnerフリートのパフォーマンスとスケーリングを分析します。
+- パフォーマンスのボトルネックと最適化の機会を特定します。
+
+Runnerキャパシティ:
+
+- 実行中のジョブの数を、limitまたはconcurrentの値で割った値を表示します。
+- 追加のジョブを実行できるキャパシティがまだあるかどうかを判断します。
+- 利用傾向に基づいてキャパシティのアップグレードを計画します。
+
+追加のダッシュボードには以下が含まれます:
+
+- メインダッシュボード（`main.dashboard.jsonnet`）: RunnerインフラストラクチャおよびHAProxyメトリクスの概要。
+- ビジネスメトリクス（`business-stats.dashboard.jsonnet`）: ジョブ統計、完了したジョブの分数、およびRunnerの飽和度。
+- オートスケールアルゴリズム（`autoscaling-algorithm.dashboard.jsonnet`）: オートスケール動作とマシン状態の可視化。
+- キューイングの概要（`queuing-overview.dashboard.jsonnet`）: ジョブキューの深さと待機時間。
+- リクエスト並行処理（`request-concurrency.dashboard.jsonnet`）: 並行リクエスト分析。
+- デプロイ（`deployment.dashboard.jsonnet`）: デプロイ関連のメトリクス。
+- インシデントダッシュボード: オートスケール、データベース、アプリケーション、およびRunnerマネージャーのトラブルシューティングのための専用ダッシュボード。
+
+各ダッシュボードには、表示されているメトリクスの内容を説明するために、ソース`jsonnet`ファイルに説明とコンテキストが含まれています。
+
+### テンプレート変数 {#template-variables}
+
+ダッシュボードは、異なるコンテキストで再利用可能なダッシュボードテンプレートを作成するために、Grafanaテンプレート変数を使用します:
+
+- 環境: たとえば、`production`、`staging`、`development`などです。
+- ステージ: 例: `main`、`canary`。
+- タイプ: 例: `ci`、`verify`。ユースケースによって異なります。
+- シャード: オプション。分散Runnerのデプロイ用。
+
+これらのダッシュボードを実装する組織は、これらの変数を自身の環境構造に一致させる必要があります。インポート後、Grafanaダッシュボードの設定でこれらの変数を更新します。
+
+### サポートされているRunner {#supported-runners}
+
+これらのダッシュボードは、すべてのGitLab Runner executorタイプで動作します:
+
+- Kubernetes
+- Shell
+- VM（Docker Machine）
+- Windows
+
+メトリクス収集はexecutorに依存せず、すべてのRunnerフリートタイプで利用可能です。
+
+### ダッシュボードをカスタマイズ {#customize-dashboards}
+
+ご自身の環境用にダッシュボードを変更するには:
+
+1. `dashboards/ci-runners/`ディレクトリ内の`.dashboard.jsonnet`ファイルを編集します。
+1. [Grafonnet library](https://grafana.github.io/grafonnet/index.html)構文（`jsonnet`上に構築）を使用します。
+1. プレイグラウンドを使用して変更をテストします:
+
+   ```shell
+   ./test-dashboard.sh dashboards/ci-runners/your-dashboard.dashboard.jsonnet
+   ```
+
+1. `./generate-dashboards.sh`を使用して再生成し、デプロイします。
+
+詳細については、[ダッシュボード拡張に関するビデオガイド](https://www.youtube.com/watch?v=yZ2RiY_Akz0)を参照してください。
+
+### KubernetesでのRunnerのモニタリングに関する考慮事項 {#considerations-for-monitoring-runners-on-kubernetes}
+
+OpenShift、Amazon EKS、GKEなどのKubernetesプラットフォームでホストされているRunnerフリートの場合は、別の方法でGrafanaダッシュボードをセットアップします。
+
+Kubernetesでは、Runner CI/CDジョブ実行ポッドを頻繁に作成および削除することがあります。このような場合は、Runnerマネージャーポッドをモニタリングし、次の機能を実装する予定を立てておく必要があります。
+
+- ゲージ: 異なるソースからの同一メトリクスの集計を表示します。
+- カウンター: `rate`または`increase`関数を適用するときにカウンターをリセットします。
+
+## 高カーディナリティメトリクス {#high-cardinality-metrics}
+
+一部のメトリクスは、高カーディナリティであるために、インジェストおよび保存の際にリソースを大量に消費する可能性があります。高カーディナリティとなるのは、多数の使用可能な値があるラベルがメトリクスに含まれており、これによって大量の一意の時系列データポイントが作成される場合です。
+
+パフォーマンスを最適化するために、このようなメトリクスはデフォルトでは有効になっていません。[FF_EXPORT_HIGH_CARDINALITY_METRICS機能フラグ](../configuration/feature-flags.md)を使用して切り替えることができます。
+
+### 高カーディナリティメトリクスのリスト {#list-of-high-cardinality-metrics}
+
+- `gitlab_runner_job_stage_duration_seconds`: 個々のジョブステージの期間（秒単位）を測定します。このメトリクスには`stage`ラベルが含まれており、定義済みの値として次のものがあります。
+
+  - `resolve_secrets`
+  - `prepare_executor`
+  - `prepare_script`
+  - `get_sources`
+  - `clear_worktree`
+  - `restore_cache`
+  - `download_artifacts`
+  - `after_script`
+  - `step_script`
+  - `archive_cache`
+  - `archive_cache_on_failure`
+  - `upload_artifacts_on_success`
+  - `upload_artifacts_on_failure`
+  - `cleanup_file_variables`
+
+  さらに、このリストに`step_run`などのカスタムユーザー定義のステップが含まれる場合があります。
+
+### 高カーディナリティメトリクスを管理する {#managing-high-cardinality-metrics}
+
+[Prometheusのrelabel設定](https://prometheus.io/docs/prometheus/latest/configuration/configuration/#relabel_config)を使用して不要なラベル値またはメトリクス全体を削除することで、カーディナリティを制御および削減できます。
+
+#### 特定のステージを削除する設定の例 {#example-configuration-to-remove-specific-stages}
+
+次の設定は、`stage`ラベルに`prepare_executor`値が設定されているすべてのメトリクスを削除します。
+
+```yaml
+scrape_configs:
+  - job_name: 'gitlab_runner_metrics'
+    static_configs:
+      - targets: ['localhost:9252']
+    metric_relabel_configs:
+      - source_labels: [__name__, "stage"]
+        regex: "gitlab_runner_job_stage_duration_seconds;prepare_executor"
+        action: drop
+```
+
+#### 関連するステージのみを保持する例 {#example-to-keep-only-relevant-stages}
+
+次の設定は、`step_script`ステージのメトリクスのみを保持し、他のメトリクスを完全に破棄します。
+
+```yaml
+scrape_configs:
+  - job_name: 'gitlab_runner_metrics'
+    static_configs:
+      - targets: ['localhost:9252']
+    metric_relabel_configs:
+      - source_labels: [__name__, "stage"]
+        regex: "gitlab_runner_job_stage_duration_seconds;step_script"
+        action: keep
+```

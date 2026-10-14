@@ -1,0 +1,118 @@
+package buildtest
+
+import (
+	"fmt"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+)
+
+func RunBuildWithCleanupGitClone(t *testing.T, build *common.Build) {
+	build.Variables = append(
+		build.Variables,
+		spec.Variable{Key: "GIT_STRATEGY", Value: "clone"},
+		spec.Variable{Key: "FF_ENABLE_JOB_CLEANUP", Value: "true"},
+	)
+	out, err := RunBuildReturningOutput(t, build)
+	assert.NoError(t, err)
+	assert.Contains(t, out, "Cleaning up project directory and file based variables")
+}
+
+func RunBuildWithCleanupGitFetch(t *testing.T, build *common.Build, untrackedFilename string) {
+	build.Variables = append(
+		build.Variables,
+		spec.Variable{Key: "GIT_STRATEGY", Value: "fetch"},
+		spec.Variable{Key: "FF_ENABLE_JOB_CLEANUP", Value: "true"},
+	)
+
+	out, err := RunBuildReturningOutput(t, build)
+	assert.NoError(t, err)
+	assert.Contains(t, out, "Cleaning up project directory and file based variables")
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFilename))
+}
+
+func RunBuildWithCleanupNormalSubmoduleStrategy(
+	t *testing.T,
+	build *common.Build,
+	untrackedFileName,
+	untrackedFileInSubmodule string,
+) {
+	build.Variables = append(
+		build.Variables,
+		spec.Variable{Key: "GIT_STRATEGY", Value: "fetch"},
+		spec.Variable{Key: "GIT_SUBMODULE_STRATEGY", Value: "normal"},
+		spec.Variable{Key: "FF_ENABLE_JOB_CLEANUP", Value: "true"},
+	)
+
+	out, err := RunBuildReturningOutput(t, build)
+	assert.NoError(t, err)
+
+	assert.Contains(t, out, "Cleaning up project directory and file based variables")
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFileName))
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFileInSubmodule))
+}
+
+func RunBuildWithCleanupRecursiveSubmoduleStrategy(
+	t *testing.T,
+	build *common.Build,
+	untrackedFileName,
+	untrackedFileInSubmodule,
+	untrackedFileInSubSubmodule string,
+) {
+	build.Variables = append(
+		build.Variables,
+		spec.Variable{Key: "GIT_STRATEGY", Value: "fetch"},
+		spec.Variable{Key: "GIT_SUBMODULE_STRATEGY", Value: "recursive"},
+		spec.Variable{Key: "FF_ENABLE_JOB_CLEANUP", Value: "true"},
+		// Clones submodules from a real remote over the network, which the
+		// default GET_SOURCES_ATTEMPTS=1 gives no retry budget for. This
+		// helper backs every executor package's
+		// TestCleanupProjectGitSubmoduleRecursive. 3 matches
+		// defaultPullMaxAttempts in the image-pull retry manager, the
+		// existing convention elsewhere in this codebase for a transient
+		// external-dependency failure.
+		spec.Variable{Key: "GET_SOURCES_ATTEMPTS", Value: "3"},
+	)
+
+	out, err := RunBuildReturningOutput(t, build)
+	assert.NoError(t, err)
+
+	assert.Contains(t, out, "Cleaning up project directory and file based variables")
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFileName))
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFileInSubmodule))
+	assert.Contains(t, out, fmt.Sprintf("Removing %s", untrackedFileInSubSubmodule))
+}
+
+func GetNewUntrackedFileIntoSubmodulesCommands(
+	untrackedFile,
+	untrackedFileInSubmodule,
+	untrackedFileInSubSubmodule string,
+) []string {
+	var untrackedFilesResult []string
+	if untrackedFile != "" {
+		untrackedFilesResult = append(
+			untrackedFilesResult,
+			fmt.Sprintf("echo 'this is an untracked file' >> %s", untrackedFile),
+		)
+	}
+	if untrackedFileInSubmodule != "" {
+		untrackedFilesResult = append(
+			untrackedFilesResult,
+			fmt.Sprintf(
+				"echo 'this is an untracked file in the submodule' >> gitlab-grack/%s",
+				untrackedFileInSubmodule,
+			))
+	}
+	if untrackedFileInSubSubmodule != "" {
+		untrackedFilesResult = append(
+			untrackedFilesResult,
+			fmt.Sprintf(
+				"echo 'this is an untracked file in the sub-submodule' >> gitlab-grack/tests/example/%s",
+				untrackedFileInSubSubmodule,
+			))
+	}
+	return untrackedFilesResult
+}

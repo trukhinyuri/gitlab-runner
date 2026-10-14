@@ -1,0 +1,262 @@
+package docker
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"path"
+	"strings"
+
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/omitwriter"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/internal/readywriter"
+	"gitlab.com/gitlab-org/gitlab-runner/steps"
+)
+
+const bootstrappedBinary = "/opt/gitlab-runner/gitlab-runner-helper"
+
+type conn struct {
+	resp    client.HijackedResponse
+	reader  *io.PipeReader
+	cleanup func()
+}
+
+func (c *conn) Read(p []byte) (int, error) {
+	return c.reader.Read(p)
+}
+
+func (c *conn) Write(p []byte) (int, error) {
+	return c.resp.Conn.Write(p)
+}
+
+func (c *conn) Close() error {
+	err := c.reader.Close()
+	_ = c.resp.Conn.Close()
+	c.cleanup()
+
+	return err
+}
+
+//nolint:gocognit
+func (s *commandExecutor) Connect(ctx context.Context) (func() (io.ReadWriteCloser, error), error) {
+	ctr, err := s.requestBuildContainer()
+	if err != nil {
+		return nil, fmt.Errorf("creating build container for dialer: %w", err)
+	}
+
+	// initCtx is used for starting the container and waiting until it is ready, we're okay
+	// to cancel on defer, because the closure returned does not rely on it. The closure only
+	// relies on the container having started, and if that changes between now and the closure
+	// being executed, that will safely result in a timeout during the connection.
+	initCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	stdout := s.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stdout)
+	defer stdout.Close()
+
+	stderr := s.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stderr)
+	defer stderr.Close()
+
+	hijacked, err := s.dockerConn.ContainerAttach(initCtx, ctr.ID, client.ContainerAttachOptions{
+		Stream: true,
+		Stdout: true,
+		Stderr: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("connect container attach: %w", err)
+	}
+	defer hijacked.Close()
+
+	okCh, errCh := s.dockerConn.ContainerWait(initCtx, ctr.ID, container.WaitConditionNextExit)
+
+	if err := s.dockerConn.ContainerStart(initCtx, ctr.ID, client.ContainerStartOptions{}); err != nil {
+		return nil, fmt.Errorf("connect container start: %w", err)
+	}
+
+	readyWriter, readyCh := readywriter.New(initCtx, stderr)
+
+	// stream container log to job
+	go func() {
+		_, _ = stdcopy.StdCopy(stdout, readyWriter, hijacked.Reader)
+		_ = readyWriter.Close()
+	}()
+
+	// Build containers usually have to provide a shell to execute scripts on,
+	// for Functions, we continue to make use of this to execute the step-runner.
+	//
+	// However, Docker executors supports a mode called "job script as entrypoint":
+	//
+	// The build container does all of the work, and any script provided may
+	// or may not be executed. Because this happens implicitly, we cannot determine
+	// if that's going to be the case or not. So the solution is:
+	//
+	// - We wait indefinitely for the step-runner to return its ready message.
+	//   There's no other timeout here, other than the job timeout. So if the
+	//   step-runner just silently doesn't arrive, we'll never know.
+	// - On exit, if there's a non-zero code, we return a BuildError. If it
+	//   was a clean exit, we tell step-runner to not bother connecting by
+	//   returning ErrNoStepRunnerButOkay.
+	var socketPath string
+	var readyChOk bool
+
+	select {
+	case socketPath, readyChOk = <-readyCh:
+		if !readyChOk {
+			return nil, fmt.Errorf("step-runner ready channel closed")
+		}
+		if socketPath == "" {
+			return nil, fmt.Errorf("step-runner ready message missing socket path")
+		}
+
+	case err := <-errCh:
+		return nil, fmt.Errorf("connect container wait: %w", err)
+
+	case result := <-okCh:
+		if result.StatusCode != 0 {
+			exitCode := common.NormalizeExitCode(int(result.StatusCode))
+			return nil, &common.BuildError{
+				Inner:    fmt.Errorf("exit code %d", exitCode),
+				ExitCode: exitCode,
+			}
+		}
+
+		return nil, steps.ErrNoStepRunnerButOkay
+
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	return func() (io.ReadWriteCloser, error) {
+		resp, err := s.dockerConn.ContainerExecCreate(ctx, ctr.ID, client.ExecCreateOptions{
+			Cmd:          []string{bootstrappedBinary, "steps", "proxy", "--socket", socketPath},
+			AttachStdin:  true,
+			AttachStderr: true,
+			AttachStdout: true,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		hijacked, err := s.dockerConn.ContainerExecAttach(ctx, resp.ID, client.ExecAttachOptions{})
+		if err != nil {
+			return nil, err
+		}
+
+		r, w := io.Pipe()
+		go func() {
+			stderr := omitwriter.New()
+			_, err := stdcopy.StdCopy(w, stderr, hijacked.Reader)
+			if err != nil {
+				err = fmt.Errorf("%w: %w", err, stderr.Error())
+			}
+			w.CloseWithError(err)
+		}()
+
+		return &conn{
+			resp:   hijacked,
+			reader: r,
+			cleanup: func() {
+				if err := s.dockerConn.ContainerStop(s.Context, ctr.ID, client.ContainerStopOptions{}); err != nil {
+					s.BuildLogger.Errorln("Stopping steps container", err)
+				}
+			},
+		}, nil
+	}, nil
+}
+
+func (e *executor) bootstrap() error {
+	if !e.Build.UseNativeSteps() {
+		return nil
+	}
+
+	e.SetCurrentStage(ExecutorStageBootstrap)
+	e.BuildLogger.Debugln("Creating bootstrap volume...")
+
+	ctx, cancel := context.WithCancel(e.Context)
+	defer cancel()
+
+	if err := e.volumesManager.CreateTemporary(ctx, path.Dir(bootstrappedBinary)); err != nil {
+		return fmt.Errorf("bootstrap volume: %w", err)
+	}
+
+	helperImage, err := e.getHelperImage()
+	if err != nil {
+		return fmt.Errorf("bootstrap helper image: %w", err)
+	}
+
+	containerConfig := &container.Config{
+		Image:           helperImage.ID,
+		Cmd:             []string{"gitlab-runner-helper", "steps", "bootstrap", bootstrappedBinary},
+		Tty:             false,
+		AttachStdin:     false,
+		AttachStdout:    true,
+		AttachStderr:    true,
+		OpenStdin:       false,
+		StdinOnce:       true,
+		NetworkDisabled: true,
+	}
+	hostConfig := &container.HostConfig{
+		AutoRemove:     true,
+		ReadonlyRootfs: true, // todo: windows doesn't support read-only fs
+		RestartPolicy:  neverRestartPolicy,
+		Binds:          e.volumesManager.Binds(),
+		NetworkMode:    network.NetworkNone,
+		Runtime:        e.Config.Docker.Runtime,
+		Isolation:      container.Isolation(e.Config.Docker.Isolation),
+	}
+
+	bootstrapContainer, err := e.dockerConn.ContainerCreate(ctx, containerConfig, hostConfig, nil, nil, "")
+	if err != nil {
+		return fmt.Errorf("bootstrap container create: %w", err)
+	}
+	defer func() {
+		_ = e.dockerConn.ContainerRemove(ctx, bootstrapContainer.ID, client.ContainerRemoveOptions{
+			RemoveVolumes: true,
+			Force:         true,
+		})
+	}()
+
+	hijacked, err := e.dockerConn.ContainerAttach(ctx, bootstrapContainer.ID, client.ContainerAttachOptions{
+		Stream: true,
+		Stdout: true,
+		Stderr: true,
+	})
+	if err != nil {
+		return fmt.Errorf("bootstrap container attach: %w", err)
+	}
+	defer hijacked.Close()
+
+	okCh, errCh := e.dockerConn.ContainerWait(ctx, bootstrapContainer.ID, container.WaitConditionNextExit)
+
+	if err := e.dockerConn.ContainerStart(ctx, bootstrapContainer.ID, client.ContainerStartOptions{}); err != nil {
+		return fmt.Errorf("bootstrap container start: %w", err)
+	}
+
+	select {
+	case err := <-errCh:
+		buf := new(bytes.Buffer)
+		_, _ = stdcopy.StdCopy(buf, buf, io.LimitReader(hijacked.Reader, 1024))
+
+		return fmt.Errorf("bootstrap container wait: %w (%v)", err, buf.String())
+
+	case ok := <-okCh:
+		if ok.StatusCode != 0 {
+			buf := new(bytes.Buffer)
+			_, _ = stdcopy.StdCopy(buf, buf, io.LimitReader(hijacked.Reader, 1024))
+
+			// detect if this helper is too old to support the functions subcommand
+			if strings.Contains(buf.String(), "Command steps not found") {
+				return fmt.Errorf("helper does not contain CI Steps support: please upgrade your version of the GitLab Runner helper binary")
+			}
+			return fmt.Errorf("bootstrap container non zero exit: %v (%v) %v", ok.Error, ok.StatusCode, buf.String())
+		}
+	}
+
+	return nil
+}

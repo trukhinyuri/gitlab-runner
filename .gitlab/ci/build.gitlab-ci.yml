@@ -1,0 +1,204 @@
+helper images:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - .docker
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  stage: build
+  needs:
+    - "binaries"
+  script:
+    - ./ci/touch_git
+    - make helper-images
+    - ls -alh out/helper-images/
+  retry: 2
+  artifacts:
+    paths:
+      - out/helper-images/
+    expire_in: 7d
+  parallel:
+    matrix:
+      - TARGETS:
+          - alpine alpine-pwsh ubuntu ubuntu-pwsh ubi-fips concrete
+          - windows-nanoserver-ltsc2019 windows-servercore-ltsc2019
+          - windows-nanoserver-ltsc2022 windows-servercore-ltsc2022
+          - windows-nanoserver-ltsc2025 windows-servercore-ltsc2025
+          - windows-nanoserver-ltsc2025-arm64 windows-servercore-ltsc2025-arm64
+
+prebuilt helper images:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - .docker
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  stage: build
+  image: "${RUNNER_IMAGES_REGISTRY}/ci:${RUNNER_IMAGES_VERSION}-prebuilt-images"
+  needs:
+    - "helper images: [alpine alpine-pwsh ubuntu ubuntu-pwsh ubi-fips concrete]"
+  script:
+    - make prebuilt-helper-images
+    - ls -alh out/helper-images/
+  artifacts:
+    paths:
+      - out/helper-images/*.tar.xz
+      - out/helper-images/*.tar.zst
+    expire_in: 7d
+
+prebuilt helper images windows 2019:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - prebuilt helper images
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  needs:
+    - "helper images: [windows-nanoserver-ltsc2019 windows-servercore-ltsc2019]"
+
+prebuilt helper images windows 2022:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - prebuilt helper images
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  needs:
+    - "helper images: [windows-nanoserver-ltsc2022 windows-servercore-ltsc2022]"
+
+prebuilt helper images windows 2025:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - prebuilt helper images
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  needs:
+    - "helper images: [windows-nanoserver-ltsc2025 windows-servercore-ltsc2025]"
+
+prebuilt helper images windows 2025 arm64:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - prebuilt helper images
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  needs:
+    - "helper images: [windows-nanoserver-ltsc2025-arm64 windows-servercore-ltsc2025-arm64]"
+
+runner images:
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - .docker
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+  stage: build
+  needs:
+    - "binaries"
+  script:
+    - ./ci/touch_git
+    - TARGETS="ubuntu alpine ubi-fips" make runner-images
+    - ls -alh out/runner-images/
+  retry: 2
+  artifacts:
+    paths:
+      - out/runner-images/
+    expire_in: 7d
+
+test images:
+  extends:
+    - .docker
+    - .rules:build:test:images:merge-requests
+  stage: build
+  needs:
+    - "binaries"
+  script:
+    - docker buildx create --name builder --use --driver docker-container default || true
+    - echo "${CI_REGISTRY_PASSWORD}" | docker login --username "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
+    - cd tests/dockerfiles && docker buildx bake --progress plain tests-images --set *.output="type=registry,compression=zstd"
+    - docker logout "${CI_REGISTRY}"
+
+binaries:
+  image: "${RUNNER_IMAGES_REGISTRY}/ubi-go:${RUNNER_IMAGES_VERSION}"
+  tags:
+    - !reference [.instance-2xlarge]
+  extends:
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+    - .rules:sign_binaries
+    - .google-oidc:auth
+    - .go-cache
+  stage: build
+  needs: []
+  before_script:
+    - !reference [.go-cache, before_script]
+    - !reference [.google-oidc:auth, before_script]
+  script:
+    - go mod download
+    - make -j$(($(nproc) * 2)) helper-bin helper-bin-fips runner-bin runner-bin-fips
+    - |
+      if [[ "$CI_SERVER_HOST" == "gitlab.com" &&
+            ("$CI_PROJECT_PATH" == "gitlab-org/gitlab-runner" ||
+             "$CI_PROJECT_PATH" == "gitlab-org/security/gitlab-runner") &&
+            -n "$CI_COMMIT_TAG" ]]; then
+        echo "Signing binaries..."
+        scripts/sign-windows-binaries
+        scripts/sign-macos-binaries
+      else
+        echo "Not signing binaries"
+      fi
+  artifacts:
+    paths:
+      - out/binaries/gitlab-runner*
+    expire_in: 7d
+
+clone test repo:
+  extends:
+    - .rules:merge_request_pipelines:no_docs
+    - .no_cache_and_dependencies
+    - .kubernetes runner
+  stage: build
+  image: alpine:latest
+  needs: []
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - apk add git
+    - mkdir tmp
+    - succeed=0
+    - i=1
+    - |
+      while [ "$i" -le 3 ]; do
+        rm -rf tmp/gitlab-test && git clone https://gitlab.com/gitlab-org/ci-cd/gitlab-runner-pipeline-tests/gitlab-test tmp/gitlab-test && succeed=1 && break
+        i=$((i + 1))
+        [ "$i" -le 3 ] && echo "retrying"
+      done
+    - '[ "$succeed" -eq 1 ]'
+  artifacts:
+    paths:
+      - tmp/gitlab-test
+    expire_in: 7d
+
+rpm verify fips:
+  stage: build
+  extends:
+    - .rules:merge_request_pipelines:no_docs:no-community-mr
+    - .kubernetes runner
+  image: "registry.gitlab.com/gitlab-org/cloud-native/container-dependencies-finder/cdf:main"
+  needs:
+    - "runner images"
+    - "helper images: [alpine alpine-pwsh ubuntu ubuntu-pwsh ubi-fips concrete]"
+  variables:
+    # VERBOSE: 1
+    OCI_TARS: |-
+      runner=out/runner-images/ubi-fips.tar
+      helper=out/helper-images/ubi-fips-x86_64.tar
+    # See https://gitlab.com/gitlab-org/gitlab-runner/-/merge_requests/6370
+    # Disable mtime checks within `rpm --verify`
+    RPM_VERIFY_NOMTIME: "true"
+  script:
+    - ci/rpm_verify_fips
+  artifacts:
+    paths:
+      - logs/
+    expire_in: 7d
+
+# prepare done is used as a sentinel for "Prepare" stage completion, so we can kick off builds in later stages
+# without waiting for the completion of the Prebuild stage
+prepare done:
+  stage: build
+  extends:
+    - .stage_done

@@ -1,0 +1,604 @@
+package shells
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"path"
+	"runtime"
+	"strconv"
+	"strings"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/featureflags"
+)
+
+const (
+	Bash = "bash"
+
+	BashDetectShellScript = `if [ -x /usr/local/bin/bash ]; then
+	exec /usr/local/bin/bash $@
+elif [ -x /usr/bin/bash ]; then
+	exec /usr/bin/bash $@
+elif [ -x /bin/bash ]; then
+	exec /bin/bash $@
+elif [ -x /usr/local/bin/sh ]; then
+	exec /usr/local/bin/sh $@
+elif [ -x /usr/bin/sh ]; then
+	exec /usr/bin/sh $@
+elif [ -x /bin/sh ]; then
+	exec /bin/sh $@
+elif [ -x /busybox/sh ]; then
+	exec /busybox/sh $@
+else
+	echo shell not found
+	exit 1
+fi
+
+`
+
+	// This script is intended to be run in docker or kubernetes containers only to ensure graceful shutdown of build,
+	// service and potentially other containers. It sends SIGTERM to all PIDs excluding itself and 1, in decreasing numeric
+	// order, positing that the higher PIDs are likely the processes blocking and thus preventing the container from
+	// shutting down cleanly. The inner while loop waits for up to 5 seconds for the last killed PID to exit before moving
+	// onto the next PID. Note that processes that are shells will ignore SIGTERM anyway, so this script is not as heavy
+	// handed as it might appear.
+	ContainerSigTermScriptForLinux = `PROCS=$(cd /proc && ls -rvd [0-9]*) &&
+for P in $PROCS; do
+	if [ $$ -ne $P ] && [ $P -ne 1 ]; then
+		kill -TERM $P 2>/dev/null &&
+		ATTEMPTS=6 &&
+		while [ -e /proc/$P ] && [ $ATTEMPTS -gt 0 ]; do
+			sleep 1 && ATTEMPTS=$((ATTEMPTS-1));
+		done;
+	fi;
+done
+`
+
+	// bashJSONTerminationScript prints a json log-line to provide exit code context to
+	// executors that cannot directly retrieve the exit status of the script.
+	bashJSONTerminationScript = `runner_script_trap() {
+	exit_code=$?
+	out_json="{\"command_exit_code\": $exit_code, \"script\": \"$0\"}"
+
+	echo ""
+	echo "$out_json"
+	exit 0
+}
+
+trap runner_script_trap EXIT
+`
+
+	// Two separate bash code paths can dump the executed script body to
+	// the job log when the cancellation kill loop signals a stage script:
+	//
+	//   - bash <4.4: a process killed by SIGTERM with no trap prints its
+	//     current command before terminating (suppressed upstream in
+	//     bash 4.4 by the DONT_REPORT_SIGTERM define).
+	//   - bash 5.3+: the parent shell, on reaping a child that was killed
+	//     by a signal, prints the failed pipeline's text — see the new
+	//     print_pipeline call inside notify_of_job_status.
+	//
+	// With this trap installed both in the outer shell AND inside the
+	// eval-subshell (traps reset to defaults across the subshell
+	// boundary), SIGTERM in either context triggers a clean `exit 1`
+	// instead of a signal-induced death, so neither code path fires. See
+	// https://gitlab.com/gitlab-org/gitlab-runner/-/issues/39005.
+	bashExitOnScriptTerminationSignal = `trap 'exit 1' TERM`
+
+	bashJSONInitializationScript = `start_json="{\"script\": \"$0\"}"
+echo "$start_json"
+`
+
+	// bashCPUInfoScript prints the CPU model and the AVX extensions of the machine the job
+	// runs on, to help diagnose failures that only happen on some machine types of a
+	// CPU-heterogeneous fleet. It's a script rather than Go code because Go runs in the
+	// runner process, and with executors like kubernetes, instance or docker-autoscaler
+	// that isn't the machine the job runs on. It's best effort: it runs in a subshell,
+	// prints "unknown" when there's no model name, such as on arm64, and never fails the job.
+	// lscpu prints "Model name: -" on some arm64 VMs, which is treated as no model name.
+	bashCPUInfoScript = `(
+  model=$(awk -F ': *' '/^model name/ { print $2; exit }' /proc/cpuinfo 2>/dev/null)
+  [ -n "$model" ] || model=$(LC_ALL=C lscpu 2>/dev/null | awk -F ': *' '/^Model name/ { print $2; exit }')
+  [ "$model" != "-" ] || model=
+  flags=$(awk '/^flags/ { print; exit }' /proc/cpuinfo 2>/dev/null)
+  isa=
+  for f in avx avx2 avx512f; do
+    case " $flags " in *" $f "*) isa="$isa${isa:+, }$f" ;; esac
+  done
+  echo "Running on CPU: ${model:-unknown}${isa:+ ($isa)}"
+) || true`
+)
+
+type BashShell struct {
+	AbstractShell
+	Shell string
+}
+
+type BashWriter struct {
+	bytes.Buffer
+	TemporaryPath string
+	Shell         string
+	indent        int
+
+	checkForErrors                   bool
+	useLegacyBashEval                bool
+	usePosixEscape                   bool
+	useJSONInitializationTermination bool
+}
+
+func NewBashWriter(build *common.Build, shell string) *BashWriter {
+	return &BashWriter{
+		TemporaryPath:     build.TmpProjectDir(),
+		Shell:             shell,
+		checkForErrors:    build.IsFeatureFlagOn(featureflags.EnableBashExitCodeCheck),
+		useLegacyBashEval: build.IsFeatureFlagOn(featureflags.UseLegacyBashEval),
+		usePosixEscape:    build.IsFeatureFlagOn(featureflags.PosixlyCorrectEscapes),
+		// useJSONInitializationTermination is only used for kubernetes executor when
+		// the feature flag FF_USE_LEGACY_KUBERNETES_EXECUTION_STRATEGY is set to false
+		useJSONInitializationTermination: build.Runner.Executor == common.ExecutorKubernetes &&
+			!build.IsFeatureFlagOn(featureflags.UseLegacyKubernetesExecutionStrategy),
+	}
+}
+
+func (b *BashWriter) GetTemporaryPath() string {
+	return b.TemporaryPath
+}
+
+func (b *BashWriter) Line(text string) {
+	b.WriteString(strings.Repeat("  ", b.indent) + text + "\n")
+}
+
+func (b *BashWriter) Linef(format string, arguments ...any) {
+	b.Line(fmt.Sprintf(format, arguments...))
+}
+
+func (b *BashWriter) CheckForErrors() {
+	if !b.checkForErrors {
+		return
+	}
+
+	b.Line("_runner_exit_code=$?; if [ $_runner_exit_code -ne 0 ]; then exit $_runner_exit_code; fi")
+}
+
+func (b *BashWriter) Indent() {
+	b.indent++
+}
+
+func (b *BashWriter) Unindent() {
+	b.indent--
+}
+
+func (b *BashWriter) Command(command string, arguments ...string) {
+	b.Line(b.buildCommand(b.escape, command, arguments...))
+	b.CheckForErrors()
+}
+
+// SetupGitCredHelper is the bash implementation of setting up the runner's default cred helper, which pulls out the job
+// token from the environment.
+func (b *BashWriter) SetupGitCredHelper(confFile, section, user string) {
+	helperSection := b.escape(section + ".helper")
+	userSection := b.escape(section + ".username")
+	emptyArg := `""`
+
+	b.Line(
+		fmt.Sprintf(
+			`git config -f %[1]s --replace-all %[2]s %[3]s && `+
+				`git config -f %[1]s --add %[2]s %[4]s && `+
+				`git config -f %[1]s %[5]s %[6]s`,
+			doubleQuote(confFile),
+			helperSection,
+			emptyArg,
+			b.escape(credHelperCommand),
+			userSection,
+			user,
+		),
+	)
+	b.CheckForErrors()
+}
+
+func (b *BashWriter) CommandWithStdin(bestEffort bool, stdin string, command string, arguments ...string) {
+	producer := b.buildCommand(b.escape, "echo", stdin)
+	consumer := b.buildCommand(b.escape, command, arguments...)
+
+	line := fmt.Sprintf("%s | %s", producer, consumer)
+
+	if bestEffort {
+		// The script runs under errexit and pipefail, which would otherwise abort it.
+		b.Line(line + " || true")
+		return
+	}
+
+	b.Line(line)
+	b.CheckForErrors()
+}
+
+func (b *BashWriter) CommandArgExpand(command string, arguments ...string) {
+	b.Line(b.buildCommand(doubleQuote, command, arguments...))
+	b.CheckForErrors()
+}
+
+func (b *BashWriter) buildCommand(quoter stringQuoter, command string, arguments ...string) string {
+	list := []string{
+		b.escape(command),
+	}
+
+	for _, argument := range arguments {
+		list = append(list, quoter(argument))
+	}
+
+	return strings.Join(list, " ")
+}
+
+func (b *BashWriter) TmpFile(name string) string {
+	return b.cleanPath(path.Join(b.TemporaryPath, name))
+}
+
+func (b *BashWriter) cleanPath(name string) string {
+	return b.Absolute(name)
+}
+
+func (b *BashWriter) EnvVariableKey(name string) string {
+	return fmt.Sprintf("$%s", name)
+}
+
+// Intended to be used on unmodified paths only (i.e. paths that have not been
+// cleaned with cleanPath()).
+func (b *BashWriter) isTmpFile(path string) bool {
+	return strings.HasPrefix(path, b.TemporaryPath)
+}
+
+func (b *BashWriter) Variable(variable spec.Variable) {
+	if variable.File {
+		variableFile := b.TmpFile(variable.Key)
+		b.Linef("mkdir -p %q", helpers.ToSlash(b.TemporaryPath))
+		b.Linef("printf '%%s' %s > %q", b.escape(variable.Value), variableFile)
+		b.Linef("export %s=%q", b.escape(variable.Key), variableFile)
+	} else {
+		if b.isTmpFile(variable.Value) {
+			variable.Value = b.cleanPath(variable.Value)
+		}
+		b.Linef("export %s=%s", b.escape(variable.Key), b.escape(variable.Value))
+	}
+}
+
+func (b *BashWriter) ExportRaw(name, value string) {
+	b.Linef(`export %s=%s`, b.escape(name), doubleQuote(value))
+}
+
+func (b *BashWriter) DotEnvVariables(baseFilename string, variables map[string]string) string {
+	dotEnvFile := b.TmpFile(baseFilename)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "cat << EOF > %s\n", dotEnvFile)
+	sb.WriteString(helpers.DotEnvEscape(variables))
+	sb.WriteString("EOF\n")
+
+	b.Line(sb.String())
+
+	return dotEnvFile
+}
+
+func (b *BashWriter) SourceEnv(pathname string) {
+	b.Linef("mkdir -p %q", helpers.ToSlash(b.TemporaryPath))
+	b.Linef("touch %q", pathname)
+	b.Linef(`while read -r line; do export "$line"; done < %q`, pathname)
+}
+
+func (b *BashWriter) IfDirectory(path string) {
+	b.Linef("if [ -d %q ]; then", path)
+	b.Indent()
+}
+
+func (b *BashWriter) IfFile(path string) {
+	b.Linef("if [ -e %q ]; then", path)
+	b.Indent()
+}
+
+func (b *BashWriter) IfFileReadable(path string) {
+	b.Linef("if [ -r %q ]; then", path)
+	b.Indent()
+}
+
+func (b *BashWriter) IfCmd(cmd string, arguments ...string) {
+	b.ifCmd(b.buildCommand(b.escape, cmd, arguments...) + " >/dev/null 2>&1")
+}
+
+func (b *BashWriter) IfCmdWithOutput(cmd string, arguments ...string) {
+	b.ifCmd(b.buildCommand(b.escape, cmd, arguments...))
+}
+
+func (b *BashWriter) IfCmdWithOutputArgExpand(cmd string, arguments ...string) {
+	b.ifCmd(b.buildCommand(doubleQuote, cmd, arguments...))
+}
+
+func (b *BashWriter) ifCmd(cmdline string) {
+	b.Linef("if %s ; then", cmdline)
+	b.Indent()
+}
+
+func (b *BashWriter) IfGitVersionIsAtLeast(version string) {
+	b.Linef(`current_ver="$(git version|cut -d ' ' -f 3)"`)
+	b.Linef(`required_ver=%q`, version)
+	b.Line(`minimum_ver="$(printf '%s\n%s' "$required_ver" "$current_ver" | sort -t '.' -k 1,1n -k 2,2n -k 3,3n | sed -n '1p')"`)
+	b.Linef(`if [ "$minimum_ver" = "$required_ver" ]; then`)
+	b.Printf("Git version at least %q", version)
+	b.Indent()
+}
+
+func (b *BashWriter) Else() {
+	b.Unindent()
+	b.Line("else")
+	b.Indent()
+}
+
+func (b *BashWriter) EndIf() {
+	b.Unindent()
+	b.Line("fi")
+}
+
+func (b *BashWriter) Cd(path string) {
+	b.Command("cd", path)
+}
+
+func (b *BashWriter) MkDir(path string) {
+	b.Command("mkdir", "-p", path)
+}
+
+func (b *BashWriter) MkTmpDir(name string) string {
+	path := path.Join(b.TemporaryPath, name)
+	b.MkDir(path)
+
+	return path
+}
+
+func (b *BashWriter) RmDir(path string) {
+	b.IfDirectory(path)
+	b.CommandArgExpand("chmod", "-R", "u+rwX", path)
+	b.EndIf()
+	b.CommandArgExpand("rm", "-r", "-f", path)
+}
+
+func (b *BashWriter) RmFile(path string) {
+	b.CommandArgExpand("rm", "-f", path)
+}
+
+func (b *BashWriter) RmFilesRecursive(path string, name string) {
+	b.IfDirectory(path)
+	// `find -delete` is not portable; https://unix.stackexchange.com/a/194348
+	// The '+' `find -exec` terminator is the default as it performs less invocations on supported systems.
+	//   Other systems (e.g. z/OS) will use the ';' terminator when the initial 'test find' command fails, causing `$et` to be updated.
+	//   The intitial `test find` command is used to prevent undesirable stderr output from a failed execution using the `+` terminator.
+	b.Linef(`et='+' ; find /dev/null -exec true {} + 2>/dev/null || et=';' ; find %q -name %q -type f -exec rm -f {} "${et}"`, path, name)
+	b.EndIf()
+}
+
+func (b *BashWriter) RmDirsRecursive(path string, name string) {
+	b.IfDirectory(path)
+	// `find -delete` is not portable; https://unix.stackexchange.com/a/194348
+	// The '+' `find -exec` terminator is the default as it performs less invocations on supported systems.
+	//   Other systems (e.g. z/OS) will use the ';' terminator when the initial 'test find' command fails, causing `$et` to be updated.
+	//   The intitial `test find` command is used to prevent undesirable stderr output from a failed execution using the `+` terminator.
+	b.Linef(`et='+' ; find /dev/null -exec true {} + 2>/dev/null || et=';' ; find %q -name %q -type d -depth -exec rm -rf -- {} "${et}"`, path, name)
+	b.EndIf()
+}
+
+func (b *BashWriter) Absolute(dir string) string {
+	if path.IsAbs(dir) || strings.HasPrefix(dir, "$PWD") {
+		return dir
+	}
+	return path.Join("$PWD", dir)
+}
+
+func (b *BashWriter) Join(elem ...string) string {
+	return path.Join(elem...)
+}
+
+func (b *BashWriter) Printf(format string, arguments ...any) {
+	coloredText := helpers.ANSI_RESET + fmt.Sprintf(format, arguments...)
+	b.Line("echo " + b.escape(coloredText))
+}
+
+func (b *BashWriter) Noticef(format string, arguments ...any) {
+	coloredText := helpers.ANSI_BOLD_GREEN + fmt.Sprintf(format, arguments...) + helpers.ANSI_RESET
+	b.Line("echo " + b.escape(coloredText))
+}
+
+func (b *BashWriter) Warningf(format string, arguments ...any) {
+	coloredText := helpers.ANSI_YELLOW + fmt.Sprintf(format, arguments...) + helpers.ANSI_RESET
+	b.Line("echo " + b.escape(coloredText))
+}
+
+func (b *BashWriter) Errorf(format string, arguments ...any) {
+	coloredText := helpers.ANSI_BOLD_RED + fmt.Sprintf(format, arguments...) + helpers.ANSI_RESET
+	b.Line("echo " + b.escape(coloredText))
+}
+
+func (b *BashWriter) EmptyLine() {
+	b.Line("echo")
+}
+
+func (b *BashWriter) SectionStart(id, command string, options []string) {
+	b.Line("printf '%b\\n' " +
+		"section_start:$(awk 'BEGIN{srand(); print srand()}'):section_" + id + stringifySectionOptions(options) +
+		"\r" + helpers.ANSI_CLEAR + b.escape(helpers.ANSI_BOLD_GREEN+command+helpers.ANSI_RESET))
+}
+
+func (b *BashWriter) SectionEnd(id string) {
+	b.Line("printf '%b\\n' " +
+		"section_end:$(awk 'BEGIN{srand(); print srand()}'):section_" + id +
+		"\r" + helpers.ANSI_CLEAR)
+}
+
+func (b *BashWriter) Finish(trace bool) string {
+	var buf strings.Builder
+
+	if b.Shell != "" {
+		buf.WriteString("#!/usr/bin/env " + b.Shell + "\n\n")
+	}
+
+	buf.WriteString(bashExitOnScriptTerminationSignal + "\n\n")
+
+	if b.useJSONInitializationTermination {
+		buf.WriteString(bashJSONInitializationScript)
+		buf.WriteString(bashJSONTerminationScript)
+	}
+
+	if trace {
+		buf.WriteString("set -o xtrace\n")
+	}
+
+	buf.WriteString(`case "$(set -o)" in *"pipefail"*) set -o pipefail;; esac; set -o errexit` + "\n")
+	buf.WriteString("set +o noclobber\n")
+
+	// Run the user script in an explicit subshell with stdin closed via
+	// `< /dev/null`. The TERM trap is re-installed inside this subshell so
+	// that SIGTERM causes a clean exit instead of a signal-induced death —
+	// see the comment on bashExitOnScriptTerminationSignal for details.
+	//
+	// FF_USE_LEGACY_BASH_EVAL restores the prior `: | eval '...'` pipeline
+	// form as an escape hatch for environments where the new form misbehaves.
+	if b.useLegacyBashEval {
+		buf.WriteString(": | eval " + b.escape(b.String()) + "\n")
+	} else {
+		buf.WriteString("(" + bashExitOnScriptTerminationSignal + "; eval " + b.escape(b.String()) + ") < /dev/null\n")
+	}
+
+	buf.WriteString("exit 0\n")
+
+	return buf.String()
+}
+
+func (b *BashWriter) escape(input string) string {
+	if b.usePosixEscape {
+		return helpers.PosixShellEscape(input)
+	}
+
+	return helpers.ShellEscape(input)
+}
+
+func (b *BashShell) GetName() string {
+	return b.Shell
+}
+
+func (b *BashShell) GetEntrypointCommand(info common.ShellScriptInfo, probeFile string) []string {
+	script := b.bashDetectScript(info.Type == common.LoginShell || info.Type == common.InteractiveShell)
+
+	if probeFile != "" {
+		script = fmt.Sprintf(">'%s'", probeFile) + "; " + script
+	}
+	return []string{"sh", "-c", script}
+}
+
+func (b *BashShell) bashDetectScript(useLoginOrInteractiveShell bool) string {
+	args := ""
+	if useLoginOrInteractiveShell {
+		args = "-l"
+	}
+
+	return strings.ReplaceAll(BashDetectShellScript, "$@", args)
+}
+
+func (b *BashShell) GetConfiguration(info common.ShellScriptInfo) (*common.ShellConfiguration, error) {
+	script := &common.ShellConfiguration{
+		Command: b.Shell,
+		CmdLine: b.Shell,
+	}
+
+	if info.Type == common.LoginShell || info.Type == common.InteractiveShell {
+		script.CmdLine += " -l"
+		script.Arguments = []string{"-l"}
+	}
+	script.DockerCommand = []string{"sh", "-c", b.bashDetectScript(info.Type == common.LoginShell || info.Type == common.InteractiveShell)}
+
+	if info.User == "" {
+		return script, nil
+	}
+
+	script.Command = "su"
+	if runtime.GOOS == OSLinux {
+		script.Arguments = []string{"-s", "/bin/" + b.Shell, info.User, "-c", script.CmdLine}
+	} else {
+		script.Arguments = []string{info.User, "-c", script.CmdLine}
+	}
+
+	script.CmdLine = script.Command
+	for _, arg := range script.Arguments {
+		script.CmdLine += " " + helpers.ShellEscape(arg)
+	}
+
+	return script, nil
+}
+
+func (b *BashShell) GenerateScript(
+	ctx context.Context,
+	buildStage common.BuildStage,
+	info common.ShellScriptInfo,
+) (string, error) {
+	w := NewBashWriter(info.Build, b.Shell)
+	return b.generateScript(ctx, w, buildStage, info)
+}
+
+func (b *BashShell) generateScript(
+	ctx context.Context,
+	w ShellWriter,
+	buildStage common.BuildStage,
+	info common.ShellScriptInfo,
+) (string, error) {
+	b.ensurePrepareStageHostnameMessage(w, buildStage, info)
+	b.ensurePrepareStageCPUInfoMessage(w, buildStage)
+	err := b.writeScript(ctx, w, buildStage, info)
+	script := w.Finish(info.Build.IsDebugTraceEnabled())
+	return script, err
+}
+
+func (b *BashShell) ensurePrepareStageHostnameMessage(
+	w ShellWriter,
+	buildStage common.BuildStage,
+	info common.ShellScriptInfo,
+) {
+	if buildStage == common.BuildStagePrepare {
+		if info.Build.Hostname != "" {
+			w.Line("echo " + strconv.Quote("Running on $(hostname) via "+info.Build.Hostname+"..."))
+		} else {
+			w.Line("echo " + strconv.Quote("Running on $(hostname)..."))
+		}
+	}
+}
+
+// ensurePrepareStageCPUInfoMessage writes bashCPUInfoScript into the prepare stage, right
+// after the hostname message. It's separate from ensurePrepareStageHostnameMessage so that
+// method still only does what its name says.
+func (b *BashShell) ensurePrepareStageCPUInfoMessage(w ShellWriter, buildStage common.BuildStage) {
+	if buildStage != common.BuildStagePrepare {
+		return
+	}
+
+	for line := range strings.SplitSeq(bashCPUInfoScript, "\n") {
+		w.Line(line)
+	}
+}
+
+func (b *BashShell) GenerateSaveScript(info common.ShellScriptInfo, scriptPath, script string) (string, error) {
+	w := NewBashWriter(info.Build, b.Shell)
+	return b.generateSaveScript(w, scriptPath, script)
+}
+
+func (b *BashShell) generateSaveScript(w *BashWriter, scriptPath, script string) (string, error) {
+	w.Line(fmt.Sprintf("echo %s > %s.tmp", w.escape(script), scriptPath))
+	w.Line(fmt.Sprintf("chmod 777 %s.tmp", scriptPath))
+	w.Line(fmt.Sprintf("mv %s.tmp %s", scriptPath, scriptPath))
+
+	return w.String(), nil
+}
+
+func (b *BashShell) IsDefault() bool {
+	return runtime.GOOS != OSWindows && b.Shell == "bash"
+}
+
+func init() {
+	common.RegisterShell(WrapShell(&BashShell{Shell: "sh"}))
+	common.RegisterShell(WrapShell(&BashShell{Shell: "bash"}))
+}

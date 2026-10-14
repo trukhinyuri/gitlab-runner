@@ -1,0 +1,228 @@
+package common
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+)
+
+// ExecutorData is an empty interface representing free-form data
+// executor will use. Meant to be casted, e.g. virtual machine details.
+type ExecutorData any
+
+// ExecutorDataLogger is an optional interface that ExecutorData implementations
+// can implement to provide executor-specific fields for structured logging.
+type ExecutorDataLogger interface {
+	LogFields() map[string]string
+}
+
+// GetExecutorLogFields extracts log fields from ExecutorData if it implements
+// ExecutorDataLogger, otherwise returns nil.
+func GetExecutorLogFields(data ExecutorData) map[string]string {
+	if l, ok := data.(ExecutorDataLogger); ok {
+		return l.LogFields()
+	}
+	return nil
+}
+
+// ExecutorCommand stores the script executor will run on a given stage.
+// If Predefined it will try to use already allocated resources.
+type ExecutorCommand struct {
+	Script     string
+	Stage      BuildStage
+	Predefined bool
+	Context    context.Context
+}
+
+// ExecutorStage represents a stage of build execution in the executor scope.
+type ExecutorStage string
+
+const (
+	// ExecutorStageCreated means the executor is being initialized, i.e. created.
+	ExecutorStageCreated ExecutorStage = "created"
+	// ExecutorStagePrepare means the executor is preparing its environment, initializing dependencies.
+	ExecutorStagePrepare ExecutorStage = "prepare"
+	// ExecutorStageFinish means the executor has finished build execution.
+	ExecutorStageFinish ExecutorStage = "finish"
+	// ExecutorStageCleanup means the executor is cleaning up resources.
+	ExecutorStageCleanup ExecutorStage = "cleanup"
+)
+
+// ExecutorPrepareOptions stores any data necessary for the executor to prepare
+// the environment for running a build. This includes runner configuration, build data, etc.
+type ExecutorPrepareOptions struct {
+	Config      *RunnerConfig
+	Build       *Build
+	BuildLogger buildlogger.Logger
+	User        string
+	Context     context.Context
+}
+
+type NoFreeExecutorError struct {
+	Message string
+}
+
+func (e *NoFreeExecutorError) Error() string {
+	return e.Message
+}
+
+// Executor represents entities responsible for build execution.
+// It prepares the environment, runs the build and cleans up resources.
+// See more in https://docs.gitlab.com/runner/executors/
+type Executor interface {
+	// Shell returns data about the shell and scripts this executor is bound to.
+	Shell() *ShellScriptInfo
+	// Prepare prepares the environment for build execution. e.g. connects to SSH, creates containers.
+	Prepare(options ExecutorPrepareOptions) error
+	// Run executes a command on the prepared environment.
+	Run(cmd ExecutorCommand) error
+	// Finish marks the build execution as finished.
+	Finish(err error)
+	// Cleanup cleans any resources left by build execution.
+	Cleanup()
+	// GetCurrentStage returns current stage of build execution.
+	GetCurrentStage() ExecutorStage
+	// SetCurrentStage sets the current stage of build execution.
+	SetCurrentStage(stage ExecutorStage)
+}
+
+// SuspendableExecutor is implemented by executors that can preserve a job's
+// workload state across job boundaries.
+type SuspendableExecutor interface {
+	// Suspend persists the workload state and returns the fields needed to
+	// restore it. These fields are carried in the RuntimeEnvironmentKey to a future
+	// resuming job.
+	Suspend(ctx context.Context) (url.Values, error)
+	// Resume rebuilds the workload state from the fields produced by a prior
+	// Suspend call.
+	Resume(ctx context.Context, fields url.Values) error
+}
+
+var ErrExecutorStepRunnerConnectNotSupported = fmt.Errorf("executor does not support step-runner connect")
+
+// ErrNativeStepsRequireConcrete is returned when a job needs native step
+// execution (e.g. the `run:` keyword) on an executor that supports it only via
+// the concrete whole-job path, but FF_CONCRETE is not enabled.
+var ErrNativeStepsRequireConcrete = fmt.Errorf("native step execution (e.g. the `run:` keyword) on this executor requires the FF_CONCRETE feature flag to be enabled")
+
+type ManagedExecutorProvider interface {
+	// Init initializes the executor provider.
+	//
+	// Some providers may require that a non-trivial setup will be done for them to work properly. They may also
+	// run a goroutines handling provider's state and management layer.
+	//
+	// Init method is a hook allowing to add such behavior.
+	//
+	// Init MUST BE NON-BLOCKING!
+	//
+	// The argument receives the global configuration, which may be nil.
+	Init(config *Config)
+
+	// Shutdown terminates the executor provider.
+	//
+	// As noted above, some executor providers may require to maintain a long-running state and management
+	// layer.
+	//
+	// Shutdown method is a hook that allows to inform the executor provider that it should terminate
+	// itself.
+	//
+	// Shutdown MUST BE BLOCKING until termination is done or provided context is canceled.
+	//
+	// First argument receives a context.Context object that will be canceled when shutting down will exceed
+	// configured timeout.
+	// Second argument receives the global configuration, which may be nil.
+	Shutdown(ctx context.Context, config *Config)
+}
+
+// WarmupReporter is an optional interface for executor providers that build
+// capacity at startup. /health/ready waits for it after boot-verify.
+type WarmupReporter interface {
+	// WarmupReady reports whether every runner in runners has enough capacity
+	// or has run out of warm-up time. pending describes what is still being
+	// waited on.
+	WarmupReady(runners []*RunnerConfig) (ready bool, pending string)
+}
+
+// ShutdownAwareExecutorProvider can release resources while jobs are still running.
+type ShutdownAwareExecutorProvider interface {
+	ManagedExecutorProvider
+
+	// BeginShutdown is called when the runner stops requesting jobs and starts
+	// waiting for the running ones. Acquire calls already in progress complete;
+	// Release and Shutdown are still called afterwards.
+	//
+	// BeginShutdown MUST BE NON-BLOCKING.
+	//
+	// The argument receives the global configuration, which may be nil.
+	BeginShutdown(config *Config)
+}
+
+// ExecutorProvider is responsible for managing the lifetime of executors, acquiring resources,
+// retrieving executor metadata, etc.
+type ExecutorProvider interface {
+	// CanCreate returns whether the executor provider has the necessary data to create an executor.
+	CanCreate() bool
+	// Create creates a new executor. No resource allocation happens.
+	Create() Executor
+	// Acquire acquires the necessary resources for the executor to run, e.g. finds a virtual machine.
+	Acquire(config *RunnerConfig) (ExecutorData, error)
+	// Release releases any resources locked by Acquire.
+	Release(config *RunnerConfig, data ExecutorData)
+	// GetFeatures returns metadata about the features the executor supports, e.g. variables, services, shell.
+	GetFeatures(features *FeaturesInfo) error
+	// GetConfigInfo extracts metadata about the config the executor is using, e.g. GPUs.
+	GetConfigInfo(input *RunnerConfig, output *ConfigInfo)
+
+	// GetDefaultShell returns the name of the default shell for the executor.
+	GetDefaultShell() string
+}
+
+// BuildError represents an error during build execution, not related to
+// the job script, e.g. failed to create container, establish ssh connection.
+type BuildError struct {
+	Inner         error
+	FailureReason spec.JobFailureReason
+	ExitCode      int
+}
+
+// Error implements the error interface.
+func (b *BuildError) Error() string {
+	if b.Inner == nil {
+		return "error"
+	}
+
+	return b.Inner.Error()
+}
+
+func (b *BuildError) Is(err error) bool {
+	buildErr, ok := err.(*BuildError)
+	if !ok {
+		return false
+	}
+
+	return buildErr.FailureReason == b.FailureReason
+}
+
+func (b *BuildError) Unwrap() error {
+	return b.Inner
+}
+
+func ValidateExecutorProvider(provider ExecutorProvider) error {
+	if provider.GetDefaultShell() == "" {
+		return errors.New("default shell not implemented")
+	}
+
+	if !provider.CanCreate() {
+		return errors.New("cannot create executor")
+	}
+
+	if err := provider.GetFeatures(&FeaturesInfo{}); err != nil {
+		return fmt.Errorf("cannot get features: %w", err)
+	}
+
+	return nil
+}

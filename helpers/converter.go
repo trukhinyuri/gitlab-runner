@@ -1,0 +1,76 @@
+package helpers
+
+import (
+	"bufio"
+	"bytes"
+	"fmt"
+
+	"github.com/BurntSushi/toml"
+	"go.yaml.in/yaml/v3"
+)
+
+func ToYAML(src any) string {
+	data, err := yaml.Marshal(src)
+	if err == nil {
+		return string(data)
+	}
+	return ""
+}
+
+func ToTOML(src any) string {
+	var data bytes.Buffer
+	buffer := bufio.NewWriter(&data)
+
+	if err := toml.NewEncoder(buffer).Encode(src); err != nil {
+		return ""
+	}
+
+	if err := buffer.Flush(); err != nil {
+		return ""
+	}
+
+	return data.String()
+}
+
+func ToConfigMap(list any) (map[string]any, bool) {
+	x, ok := list.(map[string]any)
+	if ok {
+		return x, ok
+	}
+
+	y, ok := list.(map[any]any)
+	if !ok {
+		return nil, false
+	}
+
+	result := make(map[string]any)
+	for k, v := range y {
+		key, ok := k.(string)
+		if !ok {
+			panic(fmt.Sprintf("failed to coerce config-map key %v to string", k))
+		}
+		result[key] = v
+	}
+
+	return result, true
+}
+
+func GetMapKey(value map[string]any, keys ...string) (result any, ok bool) {
+	result = value
+
+	for _, key := range keys {
+		switch t := result.(type) {
+		case map[string]any:
+			if result, ok = t[key]; ok {
+				continue
+			}
+		case map[any]any:
+			if result, ok = t[key]; ok {
+				continue
+			}
+		}
+		return nil, false
+	}
+
+	return result, true
+}

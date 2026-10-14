@@ -1,0 +1,1262 @@
+//go:build !integration
+
+package custom
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/custom/command"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/process"
+)
+
+type executorTestCase struct {
+	config common.RunnerConfig
+
+	commandStdoutContent string
+	commandStderrContent string
+	commandErr           error
+
+	doNotMockCommandFactory bool
+
+	adjustExecutor func(t *testing.T, e *executor)
+	adjustOptions  func(t *testing.T, options common.ExecutorPrepareOptions)
+
+	assertBuild          func(t *testing.T, b *common.Build)
+	assertCommandFactory func(
+		t *testing.T,
+		tt executorTestCase,
+		ctx context.Context,
+		executable string,
+		args []string,
+		cmdOpts process.CommandOptions,
+		options command.Options,
+	)
+	assertOutput          func(t *testing.T, output string)
+	assertExecutor        func(t *testing.T, e *executor)
+	expectedError         string
+	expectedFailureReason spec.JobFailureReason
+}
+
+func getRunnerConfig(custom *common.CustomConfig) common.RunnerConfig {
+	rc := common.RunnerConfig{
+		RunnerCredentials: common.RunnerCredentials{
+			Token: "RuNnErToKeN",
+		},
+		RunnerSettings: common.RunnerSettings{
+			BuildsDir: "/builds",
+			CacheDir:  "/cache",
+			Shell:     "bash",
+		},
+	}
+
+	if custom != nil {
+		rc.Custom = custom
+	}
+
+	return rc
+}
+
+func prepareExecutorForCleanup(t *testing.T, tt executorTestCase) (*executor, *bytes.Buffer) {
+	e, options, out := prepareExecutor(t, tt)
+
+	e.Config = *options.Config
+	e.Build = options.Build
+	e.BuildLogger = options.BuildLogger
+
+	return e, out
+}
+
+// projectDir is the path the fixture repository URL maps to under builds_dir
+// and cache_dir.
+const projectDir = "gitlab-org/ci-cd/gitlab-runner-pipeline-tests/gitlab-test"
+
+func prepareExecutor(t *testing.T, tt executorTestCase) (*executor, common.ExecutorPrepareOptions, *bytes.Buffer) {
+	out := bytes.NewBuffer([]byte{})
+
+	// The remote fixture gives the job a repository URL, so the project
+	// directories below do not depend on a local clone being present.
+	successfulBuild, err := common.GetRemoteSuccessfulBuild()
+	require.NoError(t, err)
+
+	successfulBuild.ID = jobID()
+
+	trace := common.NewMockJobTrace(t)
+	trace.On("Write", mock.Anything).
+		Run(func(args mock.Arguments) {
+			_, err := io.Copy(out, bytes.NewReader(args.Get(0).([]byte)))
+			require.NoError(t, err)
+		}).
+		Return(0, nil).
+		Maybe()
+	trace.On("IsStdout").
+		Return(false).
+		Maybe()
+
+	options := common.ExecutorPrepareOptions{
+		Build: &common.Build{
+			Job:    successfulBuild,
+			Runner: &tt.config,
+		},
+		Config:      &tt.config,
+		Context:     t.Context(),
+		BuildLogger: buildlogger.New(trace, logrus.WithFields(logrus.Fields{}), buildlogger.Options{}),
+	}
+
+	e := new(executor)
+
+	return e, options, out
+}
+
+var currentJobID = int64(0)
+
+func jobID() int64 {
+	i := currentJobID
+	currentJobID++
+
+	return i
+}
+
+func assertOutput(t *testing.T, tt executorTestCase, out *bytes.Buffer) {
+	if tt.assertOutput == nil {
+		return
+	}
+
+	tt.assertOutput(t, out.String())
+}
+
+func mockCommandFactory(t *testing.T, tt executorTestCase) {
+	if tt.doNotMockCommandFactory {
+		return
+	}
+
+	outputs := commandOutputs{
+		stdout: nil,
+		stderr: nil,
+	}
+
+	cmd := command.NewMockCommand(t)
+	cmd.On("Run").
+		Run(func(_ mock.Arguments) {
+			if outputs.stdout != nil {
+				defer outputs.stdout.Close()
+			}
+			if outputs.stderr != nil {
+				defer outputs.stderr.Close()
+			}
+			if tt.commandStdoutContent != "" && outputs.stdout != nil {
+				_, err := fmt.Fprintln(outputs.stdout, tt.commandStdoutContent)
+				require.NoError(t, err, "Unexpected error on mocking command output to stdout")
+			}
+
+			if tt.commandStderrContent != "" && outputs.stderr != nil {
+				_, err := fmt.Fprintln(outputs.stderr, tt.commandStderrContent)
+				require.NoError(t, err, "Unexpected error on mocking command output to stderr")
+			}
+		}).
+		Return(tt.commandErr)
+
+	oldFactory := commandFactory
+	commandFactory =
+		func(
+			ctx context.Context,
+			executable string,
+			args []string,
+			cmdOpts process.CommandOptions,
+			options command.Options,
+		) command.Command {
+			if tt.assertCommandFactory != nil {
+				tt.assertCommandFactory(t, tt, ctx, executable, args, cmdOpts, options)
+			}
+
+			outputs.stdout = buildlogger.NewNopCloser(cmdOpts.Stdout)
+			outputs.stderr = buildlogger.NewNopCloser(cmdOpts.Stderr)
+
+			return cmd
+		}
+
+	t.Cleanup(func() {
+		commandFactory = oldFactory
+	})
+}
+
+func TestExecutor_Prepare(t *testing.T) {
+	tests := map[string]executorTestCase{
+		"AbstractExecutor.Prepare failure": {
+			config:                  common.RunnerConfig{},
+			doNotMockCommandFactory: true,
+			expectedError:           "custom executor not configured",
+			expectedFailureReason:   common.ConfigurationError,
+		},
+		"custom executor not set": {
+			config:                  getRunnerConfig(nil),
+			doNotMockCommandFactory: true,
+			expectedError:           "custom executor not configured",
+			expectedFailureReason:   common.ConfigurationError,
+		},
+		"custom executor set without RunExec": {
+			config:                  getRunnerConfig(&common.CustomConfig{}),
+			doNotMockCommandFactory: true,
+			expectedError:           "custom executor is missing RunExec",
+			expectedFailureReason:   common.ConfigurationError,
+		},
+		"custom executor set": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec: "bash",
+			}),
+			doNotMockCommandFactory: true,
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+		},
+		"custom executor set with ConfigExec with error": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+				ConfigArgs: []string{"test"},
+			}),
+			commandErr: errors.New("test-error"),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+				assert.Equal(t, tt.config.Custom.ConfigArgs, args)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.NotContains(t, output, "Using Custom executor...")
+			},
+			expectedError: "test-error",
+		},
+		"custom executor set with ConfigExec with invalid JSON": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: "abcd",
+			commandErr:           nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.NotContains(t, output, "Using Custom executor...")
+			},
+			expectedError: "error while parsing JSON output: invalid character 'a' looking for beginning of value",
+		},
+		"custom executor set with ConfigExec with empty JSON": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: "",
+			commandErr:           nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+			assertBuild: func(t *testing.T, b *common.Build) {
+				assert.Equal(t, "/builds/"+projectDir, b.BuildDir)
+				assert.Equal(t, "/cache/"+projectDir, b.CacheDir)
+			},
+			assertExecutor: func(t *testing.T, e *executor) {
+				assert.Nil(t, e.jobEnv)
+			},
+		},
+		"custom executor set with ConfigExec with undefined builds_dir": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: `{"builds_dir":""}`,
+			commandErr:           nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+			expectedError:         "the builds_dir is not configured",
+			expectedFailureReason: common.ConfigurationError,
+		},
+		"custom executor set with ConfigExec and driver info missing name": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: `{
+				"driver": {
+					"version": "v0.0.1"
+				}
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+		},
+		"custom executor set with ConfigExec and driver info missing version": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: `{
+				"driver": {
+					"name": "test driver"
+				}
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor with driver test driver...")
+			},
+		},
+		"custom executor set with ConfigExec": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: `{
+				"hostname": "custom-hostname",
+				"builds_dir": "/some/build/directory",
+				"cache_dir": "/some/cache/directory",
+				"builds_dir_is_shared":true,
+				"driver": {
+					"name": "test driver",
+					"version": "v0.0.1"
+				},
+				"shell": "powershell"
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor with driver test driver v0.0.1...")
+			},
+			assertBuild: func(t *testing.T, b *common.Build) {
+				assert.Equal(t, "custom-hostname", b.Hostname)
+				assert.Equal(t, "/some/build/directory/RuNnErToK/0/"+projectDir, b.BuildDir)
+				assert.Equal(t, "/some/cache/directory/"+projectDir, b.CacheDir)
+			},
+			assertExecutor: func(t *testing.T, e *executor) {
+				assert.Equal(t, "powershell", e.Shell().Shell)
+			},
+		},
+		"custom executor set with PrepareExec": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				PrepareExec: "echo",
+				PrepareArgs: []string{"test"},
+			}),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.PrepareExec, executable)
+				assert.Equal(t, tt.config.Custom.PrepareArgs, args)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+		},
+		"custom executor set with PrepareExec with error": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				PrepareExec: "echo",
+				PrepareArgs: []string{"test"},
+			}),
+			commandErr: errors.New("test-error"),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.PrepareExec, executable)
+				assert.Equal(t, tt.config.Custom.PrepareArgs, args)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "Using Custom executor...")
+			},
+			expectedError: "test-error",
+		},
+		"custom executor set with valid job_env": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			commandStdoutContent: `{
+				"builds_dir": "/some/build/directory",
+				"job_env": {
+					"FOO": "Hello",
+					"BAR": "World"
+				}
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.ConfigExec, executable)
+			},
+			assertBuild: func(t *testing.T, b *common.Build) {
+				assert.Equal(t, "/some/build/directory/"+projectDir, b.BuildDir)
+			},
+			assertExecutor: func(t *testing.T, e *executor) {
+				assert.Len(t, e.jobEnv, 2)
+				require.Contains(t, e.jobEnv, "FOO")
+				assert.Equal(t, "Hello", e.jobEnv["FOO"])
+				require.Contains(t, e.jobEnv, "BAR")
+				assert.Equal(t, "World", e.jobEnv["BAR"])
+			},
+		},
+		"custom executor set with valid job_env, verify variable order and prefix": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "run-executable",
+				ConfigExec:  "config-executable",
+				PrepareExec: "prepare-executable",
+				PrepareArgs: []string{"test"},
+			}),
+			commandStdoutContent: `{
+				"builds_dir": "/some/build/directory",
+				"job_env": {
+					"FOO": "Hello"
+				}
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				if executable != "prepare-executable" {
+					return
+				}
+
+				require.True(t, len(cmdOpts.Env) >= 2, "cmdOpts.Env must contain 2 elements or more")
+				assert.Equal(t, "FOO=Hello", cmdOpts.Env[0], "first env var must be FOO")
+				assert.True(
+					t,
+					strings.HasPrefix(cmdOpts.Env[1], "CUSTOM_ENV_"),
+					"must be followed by CUSTOM_ENV_* variables",
+				)
+			},
+		},
+		"job response file specified in file": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "run-executable",
+				ConfigExec:  "config-executable",
+				PrepareExec: "prepare-executable",
+				PrepareArgs: []string{"test"},
+			}),
+			commandStdoutContent: `{
+				"builds_dir": "/some/build/directory"
+			}`,
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.NotEmpty(t, options.JobResponseFile)
+			},
+		},
+		"custom executor variable reset before ConfigExec": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:    "bash",
+				ConfigExec: "echo",
+			}),
+			adjustOptions: func(t *testing.T, options common.ExecutorPrepareOptions) {
+				// Running this will set b.allVariables (common/build.go) before test.
+				_ = options.Build.GetAllVariables()
+
+				options.Build.RunnerID = 1
+				options.Build.ProjectRunnerID = 1
+			},
+			commandErr: nil,
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Contains(t, cmdOpts.Env, "CUSTOM_ENV_CI_CONCURRENT_PROJECT_ID=1")
+				assert.Contains(t, cmdOpts.Env, "CUSTOM_ENV_CI_CONCURRENT_ID=1")
+			},
+		},
+	}
+
+	for testName, tt := range tests {
+		t.Run(testName, func(t *testing.T) {
+			mockCommandFactory(t, tt)
+
+			e, options, out := prepareExecutor(t, tt)
+			if tt.adjustOptions != nil {
+				tt.adjustOptions(t, options)
+			}
+
+			err := e.Prepare(options)
+
+			assertOutput(t, tt, out)
+
+			if tt.assertBuild != nil {
+				tt.assertBuild(t, e.Build)
+			}
+
+			if tt.assertExecutor != nil {
+				tt.assertExecutor(t, e)
+			}
+
+			if tt.expectedError == "" {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			assert.EqualError(t, err, tt.expectedError)
+			if tt.expectedFailureReason != "" {
+				var buildErr *common.BuildError
+				require.ErrorAs(t, err, &buildErr)
+				assert.Equal(t, tt.expectedFailureReason, buildErr.FailureReason)
+			}
+		})
+	}
+}
+
+func TestExecutor_Cleanup(t *testing.T) {
+	tests := map[string]executorTestCase{
+		"custom executor not set": {
+			config: getRunnerConfig(nil),
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "custom executor not configured")
+			},
+			doNotMockCommandFactory: true,
+		},
+		"custom executor set without RunExec": {
+			config: getRunnerConfig(&common.CustomConfig{}),
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "custom executor is missing RunExec")
+			},
+			doNotMockCommandFactory: true,
+		},
+		"custom executor set": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec: "bash",
+			}),
+			doNotMockCommandFactory: true,
+		},
+		"custom executor set with CleanupExec": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				CleanupExec: "echo",
+				CleanupArgs: []string{"test"},
+			}),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.CleanupExec, executable)
+				assert.Equal(t, tt.config.Custom.CleanupArgs, args)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.NotContains(t, output, "WARNING: Cleanup script failed:")
+			},
+		},
+		"custom executor set with CleanupExec with error": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				CleanupExec: "unknown",
+			}),
+			commandStdoutContent: "some output message in commands output",
+			commandStderrContent: "some error message in commands output",
+			commandErr:           errors.New("test-error"),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.CleanupExec, executable)
+			},
+			assertOutput: func(t *testing.T, output string) {
+				assert.Contains(t, output, "WARNING: Cleanup script failed: test-error")
+			},
+		},
+		"custom executor set with valid job_env, verify variable order and prefix": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				CleanupExec: "echo",
+				CleanupArgs: []string{"test"},
+			}),
+			adjustExecutor: func(t *testing.T, e *executor) {
+				e.jobEnv = map[string]string{"FOO": "Hello"}
+			},
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				require.True(t, len(cmdOpts.Env) >= 2, "cmdOpts.Env must contain 2 elements or more")
+				assert.Equal(t, "FOO=Hello", cmdOpts.Env[0], "first env var must be FOO")
+				assert.True(
+					t,
+					strings.HasPrefix(cmdOpts.Env[1], "CUSTOM_ENV_"),
+					"must be followed by CUSTOM_ENV_* variables",
+				)
+			},
+		},
+	}
+
+	for testName, tt := range tests {
+		t.Run(testName, func(t *testing.T) {
+			mockCommandFactory(t, tt)
+
+			e, out := prepareExecutorForCleanup(t, tt)
+
+			if tt.adjustExecutor != nil {
+				tt.adjustExecutor(t, e)
+			}
+
+			e.Cleanup()
+
+			assertOutput(t, tt, out)
+		})
+	}
+}
+
+func TestExecutor_Run(t *testing.T) {
+	tests := map[string]executorTestCase{
+		"Run fails on tempdir operations": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec: "bash",
+			}),
+			doNotMockCommandFactory: true,
+			adjustExecutor: func(t *testing.T, e *executor) {
+				curDir, err := os.Getwd()
+				require.NoError(t, err)
+				e.tempDir = filepath.Join(curDir, "unknown")
+			},
+			expectedError: func() string {
+				if runtime.GOOS == "windows" {
+					return "The system cannot find the file specified"
+				}
+
+				return "no such file or directory"
+			}(),
+		},
+		"Run executes job": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec: "bash",
+			}),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.RunExec, executable)
+				assert.Len(t, args, 2)
+				assert.Equal(t, "build_script", args[1])
+			},
+		},
+		"Run executes job with error": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec:     "bash",
+				CleanupExec: "unknown",
+			}),
+			commandErr: errors.New("test-error"),
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				assert.Equal(t, tt.config.Custom.RunExec, executable)
+			},
+			expectedError: "test-error",
+		},
+		"custom executor set with valid job_env, verify variable order and prefix": {
+			config: getRunnerConfig(&common.CustomConfig{
+				RunExec: "bash",
+			}),
+			adjustExecutor: func(t *testing.T, e *executor) {
+				e.jobEnv = map[string]string{"FOO": "Hello"}
+			},
+			assertCommandFactory: func(
+				t *testing.T,
+				tt executorTestCase,
+				ctx context.Context,
+				executable string,
+				args []string,
+				cmdOpts process.CommandOptions,
+				options command.Options,
+			) {
+				require.True(t, len(cmdOpts.Env) >= 2, "cmdOpts.Env must contain 2 elements or more")
+				assert.Equal(t, "FOO=Hello", cmdOpts.Env[0], "first env var must be FOO")
+				assert.True(
+					t,
+					strings.HasPrefix(cmdOpts.Env[1], "CUSTOM_ENV_"),
+					"must be followed by CUSTOM_ENV_* variables",
+				)
+			},
+		},
+	}
+
+	for testName, tt := range tests {
+		t.Run(testName, func(t *testing.T) {
+			mockCommandFactory(t, tt)
+
+			e, options, out := prepareExecutor(t, tt)
+
+			err := e.Prepare(options)
+			require.NoError(t, err)
+
+			if tt.adjustExecutor != nil {
+				tt.adjustExecutor(t, e)
+			}
+
+			err = e.Run(common.ExecutorCommand{
+				Context: t.Context(),
+				Stage:   "step_script",
+			})
+
+			assertOutput(t, tt, out)
+
+			if tt.expectedError == "" {
+				assert.NoError(t, err)
+
+				return
+			}
+
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.expectedError)
+		})
+	}
+}
+
+func TestExecutor_Env(t *testing.T) {
+	ciJobImageEnv := "CUSTOM_ENV_CI_JOB_IMAGE"
+
+	runnerConfig := getRunnerConfig(&common.CustomConfig{
+		RunExec:     "bash",
+		PrepareExec: "echo",
+		CleanupExec: "bash",
+	})
+
+	assertCommandFactory := func(expectedImageName string) func(
+		t *testing.T,
+		tt executorTestCase,
+		ctx context.Context,
+		executable string,
+		args []string,
+		cmdOpts process.CommandOptions,
+		options command.Options,
+	) {
+		return func(
+			t *testing.T,
+			tt executorTestCase,
+			ctx context.Context,
+			executable string,
+			args []string,
+			cmdOpts process.CommandOptions,
+			options command.Options,
+		) {
+			for _, env := range cmdOpts.Env {
+				pair := strings.Split(env, "=")
+				if pair[0] == ciJobImageEnv {
+					assert.Equal(t, expectedImageName, pair[1])
+					break
+				}
+			}
+		}
+	}
+
+	adjustExecutorFactory := func(imageName string) func(t *testing.T, e *executor) {
+		return func(t *testing.T, e *executor) {
+			// the build is assumed to be non-nil across the executor codebase
+			e.Build.Image = spec.Image{Name: imageName}
+		}
+	}
+
+	tests := map[string]executorTestCase{
+		"custom executor set " + ciJobImageEnv: {
+			config:               runnerConfig,
+			adjustExecutor:       adjustExecutorFactory("test_image"),
+			assertCommandFactory: assertCommandFactory("test_image"),
+		},
+		"custom executor set empty " + ciJobImageEnv: {
+			config:               runnerConfig,
+			adjustExecutor:       adjustExecutorFactory(""),
+			assertCommandFactory: assertCommandFactory(""),
+		},
+		"custom executor set expanded " + ciJobImageEnv: {
+			config: runnerConfig,
+			adjustExecutor: func(t *testing.T, e *executor) {
+				e.Build.Variables = append(e.Build.Variables, spec.Variable{
+					Key:   "to_expand",
+					Value: "expanded",
+				})
+				adjustExecutorFactory("image:$to_expand")(t, e)
+			},
+			assertCommandFactory: assertCommandFactory("image:expanded"),
+		},
+		"custom executor set no variable to expand " + ciJobImageEnv: {
+			config:               runnerConfig,
+			adjustExecutor:       adjustExecutorFactory("image:$nothing_to_expand"),
+			assertCommandFactory: assertCommandFactory("image:"),
+		},
+	}
+
+	for tn, tt := range tests {
+		t.Run(tn, func(t *testing.T) {
+			mockCommandFactory(t, tt)
+
+			e, options, _ := prepareExecutor(t, tt)
+			e.Config = *options.Config
+			e.Build = options.Build
+			e.BuildLogger = options.BuildLogger
+			if tt.adjustExecutor != nil {
+				tt.adjustExecutor(t, e)
+			}
+
+			err := e.Prepare(options)
+			assert.NoError(t, err)
+
+			err = e.Run(common.ExecutorCommand{
+				Context: t.Context(),
+			})
+			assert.NoError(t, err)
+
+			e.Cleanup()
+		})
+	}
+}
+
+func TestExecutor_ServicesEnv(t *testing.T) {
+	const CIJobServicesEnv = "CUSTOM_ENV_CI_JOB_SERVICES"
+
+	runnerConfig := getRunnerConfig(&common.CustomConfig{
+		RunExec:     "bash",
+		PrepareExec: "echo",
+		CleanupExec: "bash",
+	})
+
+	adjustExecutorServices := func(services spec.Services) func(t *testing.T, e *executor) {
+		return func(t *testing.T, e *executor) {
+			e.Build.Services = services
+		}
+	}
+
+	assertEnvValue := func(expectedServices []jsonService) func(
+		t *testing.T,
+		tt executorTestCase,
+		ctx context.Context,
+		executable string,
+		args []string,
+		cmdOpts process.CommandOptions,
+		options command.Options,
+	) {
+		return func(
+			t *testing.T,
+			tt executorTestCase,
+			ctx context.Context,
+			executable string,
+			args []string,
+			cmdOpts process.CommandOptions,
+			options command.Options,
+		) {
+			for _, env := range cmdOpts.Env {
+				pair := strings.SplitN(env, "=", 2)
+				if pair[0] == CIJobServicesEnv {
+					expectedServicesSerialized, _ := json.Marshal(expectedServices)
+
+					assert.Equal(t, string(expectedServicesSerialized), pair[1])
+					break
+				}
+			}
+		}
+	}
+
+	assertEmptyEnv := func() func(
+		t *testing.T,
+		tt executorTestCase,
+		ctx context.Context,
+		executable string,
+		args []string,
+		cmdOpts process.CommandOptions,
+		options command.Options,
+	) {
+		return func(
+			t *testing.T,
+			tt executorTestCase,
+			ctx context.Context,
+			executable string,
+			args []string,
+			cmdOpts process.CommandOptions,
+			options command.Options,
+		) {
+			for _, env := range cmdOpts.Env {
+				pair := strings.SplitN(env, "=", 2)
+				if pair[0] == CIJobServicesEnv {
+					assert.Equal(t, "", pair[1])
+					break
+				}
+			}
+		}
+	}
+
+	tests := map[string]executorTestCase{
+		"returns only name when service name is the only definition": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name: "ruby:latest",
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:       "ruby:latest",
+						Alias:      "",
+						Entrypoint: nil,
+						Command:    nil,
+					},
+				},
+			),
+		},
+		"returns full service definition": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name:       "ruby:latest",
+					Alias:      "henk-ruby",
+					Entrypoint: []string{"path", "to", "entrypoint"},
+					Command:    []string{"path", "to", "command"},
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:       "ruby:latest",
+						Alias:      "henk-ruby",
+						Entrypoint: []string{"path", "to", "entrypoint"},
+						Command:    []string{"path", "to", "command"},
+					},
+				},
+			),
+		},
+		"returns both simple and full service definitions": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name:       "python:latest",
+					Alias:      "henk-python",
+					Entrypoint: []string{"entrypoint.sh"},
+					Command:    []string{"command --test"},
+				},
+				{
+					Name: "python:alpine",
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:       "python:latest",
+						Alias:      "henk-python",
+						Entrypoint: []string{"entrypoint.sh"},
+						Command:    []string{"command --test"},
+					},
+					{
+						Name:       "python:alpine",
+						Alias:      "",
+						Entrypoint: nil,
+						Command:    nil,
+					},
+				},
+			),
+		},
+		"returns service with single variable": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name:  "redis:latest",
+					Alias: "redis-test",
+					Variables: spec.Variables{
+						{Key: "TEST_VAR", Value: "xxxx"},
+					},
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "redis:latest",
+						Alias:     "redis-test",
+						Variables: map[string]string{"TEST_VAR": "xxxx"},
+					},
+				},
+			),
+		},
+		"returns service with multiple variables": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name: "postgres:latest",
+					Variables: spec.Variables{
+						{Key: "POSTGRES_DB", Value: "testdb"},
+						{Key: "POSTGRES_PASSWORD", Value: "secret"},
+					},
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "postgres:latest",
+						Alias:     "",
+						Variables: map[string]string{"POSTGRES_DB": "testdb", "POSTGRES_PASSWORD": "secret"},
+					},
+				},
+			),
+		},
+		"returns mixed services with and without variables": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name: "redis:latest",
+					Variables: spec.Variables{
+						{Key: "REDIS_PASSWORD", Value: "pass123"},
+					},
+				},
+				{
+					Name: "nginx:alpine",
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "redis:latest",
+						Alias:     "",
+						Variables: map[string]string{"REDIS_PASSWORD": "pass123"},
+					},
+					{
+						Name:       "nginx:alpine",
+						Alias:      "",
+						Entrypoint: nil,
+						Command:    nil,
+					},
+				},
+			),
+		},
+		"exposes masked variable value in plain text": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name: "redis:latest",
+					Variables: spec.Variables{
+						{Key: "REDIS_PASSWORD", Value: "supersecret", Masked: true},
+					},
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "redis:latest",
+						Alias:     "",
+						Variables: map[string]string{"REDIS_PASSWORD": "supersecret"},
+					},
+				},
+			),
+		},
+		"resolves file-type service variable to its contents": {
+			config: runnerConfig,
+			adjustExecutor: adjustExecutorServices(spec.Services{
+				{
+					Name: "postgres:latest",
+					Variables: spec.Variables{
+						{Key: "DB_PASSWORD", Value: "secret-file-content", File: true},
+					},
+				},
+			}),
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "postgres:latest",
+						Alias:     "",
+						Variables: map[string]string{"DB_PASSWORD": "secret-file-content"},
+					},
+				},
+			),
+		},
+		"expands service variable value referencing a build variable": {
+			config: runnerConfig,
+			adjustExecutor: func(t *testing.T, e *executor) {
+				e.Build.Variables = append(e.Build.Variables, spec.Variable{
+					Key: "BUILD_VAR", Value: "resolved-value", Public: true,
+				})
+				e.Build.Services = spec.Services{
+					{
+						Name: "postgres:latest",
+						Variables: spec.Variables{
+							{Key: "DB_URL", Value: "postgres://$BUILD_VAR/db"},
+						},
+					},
+				}
+			},
+			assertCommandFactory: assertEnvValue(
+				[]jsonService{
+					{
+						Name:      "postgres:latest",
+						Alias:     "",
+						Variables: map[string]string{"DB_URL": "postgres://resolved-value/db"},
+					},
+				},
+			),
+		},
+		"does not create env CI_JOB_SERVICES": {
+			config:               runnerConfig,
+			adjustExecutor:       adjustExecutorServices(spec.Services{}),
+			assertCommandFactory: assertEmptyEnv(),
+		},
+	}
+
+	for tn, tt := range tests {
+		t.Run(tn, func(t *testing.T) {
+			mockCommandFactory(t, tt)
+
+			e, options, _ := prepareExecutor(t, tt)
+			e.Config = *options.Config
+			e.Build = options.Build
+			e.BuildLogger = options.BuildLogger
+			if tt.adjustExecutor != nil {
+				tt.adjustExecutor(t, e)
+			}
+
+			err := e.Prepare(options)
+			assert.NoError(t, err)
+
+			err = e.Run(common.ExecutorCommand{
+				Context: t.Context(),
+			})
+			assert.NoError(t, err)
+
+			e.Cleanup()
+		})
+	}
+}

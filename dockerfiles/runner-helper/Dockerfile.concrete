@@ -1,0 +1,10 @@
+ARG BASE_IMAGE
+
+FROM $BASE_IMAGE
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG SRC_SUFFIX=""
+
+COPY --from=binary_dir gitlab-runner-helper.${TARGETOS}-${TARGETARCH}${SRC_SUFFIX} /usr/bin/gitlab-runner-helper
+CMD ["/usr/bin/gitlab-runner-helper"]

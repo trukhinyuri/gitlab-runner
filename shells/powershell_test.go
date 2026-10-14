@@ -1,0 +1,1282 @@
+//go:build !integration
+
+package shells
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+)
+
+func TestPowershell_LineBreaks(t *testing.T) {
+	testCases := map[string]struct {
+		shell                            string
+		eol                              string
+		expectedErrorPreference          string
+		shebang                          string
+		passFile                         bool
+		useJSONInitializationTermination bool
+	}{
+		"Windows newline on Desktop via stdin": {
+			shell:                   SNPowershell,
+			eol:                     "\r\n",
+			expectedErrorPreference: "",
+		},
+		"Windows newline on Desktop via file": {
+			shell:                   SNPowershell,
+			eol:                     "\r\n",
+			expectedErrorPreference: "",
+		},
+		"Windows newline on Core": {
+			shell:                   SNPwsh,
+			eol:                     "\r\n",
+			expectedErrorPreference: `$ErrorActionPreference = "Stop"` + "\r\n",
+		},
+		"Linux newline on Core": {
+			shell:                   SNPwsh,
+			eol:                     "\n",
+			shebang:                 `#!/usr/bin/env pwsh` + "\n",
+			expectedErrorPreference: `$ErrorActionPreference = "Stop"` + "\n",
+		},
+		"Windows newline on Desktop via stdin with json initialization termination": {
+			shell:                            SNPowershell,
+			eol:                              "\r\n",
+			expectedErrorPreference:          "",
+			useJSONInitializationTermination: true,
+		},
+		"Windows newline on Desktop via file with json initialization termination": {
+			shell:                            SNPowershell,
+			eol:                              "\r\n",
+			expectedErrorPreference:          "",
+			useJSONInitializationTermination: true,
+		},
+		"Windows newline on Core with json initialization termination": {
+			shell:                            SNPwsh,
+			eol:                              "\r\n",
+			expectedErrorPreference:          `$ErrorActionPreference = "Stop"` + "\r\n",
+			useJSONInitializationTermination: true,
+		},
+		"Linux newline on Core with json initialization termination": {
+			shell:                            SNPwsh,
+			eol:                              "\n",
+			shebang:                          `#!/usr/bin/env pwsh` + "\n",
+			expectedErrorPreference:          `$ErrorActionPreference = "Stop"` + "\n",
+			useJSONInitializationTermination: true,
+		},
+	}
+
+	for tn, tc := range testCases {
+		t.Run(tn, func(t *testing.T) {
+			eol := tc.eol
+			writer := &PsWriter{
+				Shell:                            tc.shell,
+				EOL:                              eol,
+				useJSONInitializationTermination: tc.useJSONInitializationTermination,
+			}
+			writer.Command("foo", "")
+
+			expectedOutput :=
+				tc.expectedErrorPreference +
+					`& "foo" ''` + eol + "if(!$?) { Exit &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }" + eol +
+					eol +
+					eol
+			if tc.shell == SNPwsh {
+				out := tc.shebang + "& {" + eol + eol
+				if tc.useJSONInitializationTermination {
+					out += fmt.Sprintf(pwshJSONInitializationScript, tc.shell) + eol + eol
+				}
+				out += expectedOutput + "}" + eol + eol
+				expectedOutput = out
+			} else {
+				out := "& {" + eol + eol
+				if tc.useJSONInitializationTermination {
+					out += fmt.Sprintf(pwshJSONInitializationScript, tc.shell) + eol + eol
+				}
+				out += expectedOutput + "}" + eol + eol
+				expectedOutput = out
+				if tc.passFile {
+					expectedOutput = "\xef\xbb\xbf" + expectedOutput
+				}
+			}
+			assert.Equal(t, expectedOutput, writer.Finish(false))
+		})
+	}
+}
+
+func TestPowershell_CommandShellEscapes(t *testing.T) {
+	writer := &PsWriter{Shell: SNPowershell, EOL: "\r\n"}
+	writer.Command("foo", "x&(y)")
+
+	assert.Equal(
+		t,
+		"& \"foo\" 'x&(y)'\r\nif(!$?) { Exit &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }\r\n\r\n",
+		writer.String(),
+	)
+}
+
+func TestPowershell_IfCmdShellEscapes(t *testing.T) {
+	writer := &PsWriter{Shell: SNPowershell, EOL: "\r\n"}
+	writer.IfCmd("foo", "x&(y)")
+
+	assert.Equal(t, "Set-Variable -Name cmdErr -Value $false\r\nTry {\r\n  & \"foo\" 'x&(y)' 2>$null\r\n  if(!$?) { throw &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }\r\n} Catch {\r\n  Set-Variable -Name cmdErr -Value $true\r\n}\r\nif(!$cmdErr) {\r\n", writer.String())
+}
+
+func TestPowershell_MkTmpDirOnUNCShare(t *testing.T) {
+	writer := &PsWriter{TemporaryPath: `\\unc-server\share`, EOL: "\n"}
+	writer.MkTmpDir("tmp")
+
+	expected := `New-Item -ItemType directory -Force -Path "\\unc-server\share\tmp" | out-null` + writer.EOL
+	if runtime.GOOS != OSWindows {
+		expected = `New-Item -ItemType directory -Force -Path "\\unc-server\share/tmp" | out-null` + writer.EOL
+	}
+
+	assert.Equal(t, expected, writer.String())
+}
+
+func TestPowershell_GetName(t *testing.T) {
+	for _, shellName := range []string{SNPwsh, SNPowershell} {
+		shell := common.GetShell(shellName)
+		assert.Equal(t, shellName, shell.GetName())
+	}
+}
+
+func TestPowershell_IsDefault(t *testing.T) {
+	for _, shellName := range []string{SNPwsh, SNPowershell} {
+		shell := common.GetShell(shellName)
+		assert.Equal(t, runtime.GOOS == OSWindows && shellName == SNPwsh, shell.IsDefault())
+	}
+}
+
+func TestPowershell_GetConfiguration(t *testing.T) {
+	const (
+		powershellStdinExpectedLine = "powershell -NoProfile -NoLogo -InputFormat text -OutputFormat text -NonInteractive -ExecutionPolicy Bypass -Command -"
+		pwshStdinExpectedLine       = "pwsh -NoProfile -NoLogo -InputFormat text -OutputFormat text -NonInteractive -ExecutionPolicy Bypass -EncodedCommand JABPAHUAdABwAHUAdABFAG4AYwBvAGQAaQBuAGcAIAA9ACAAWwBjAG8AbgBzAG8AbABlAF0AOgA6AEkAbgBwAHUAdABFAG4AYwBvAGQAaQBuAGcAIAA9ACAAWwBjAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AHAAdQB0AEUAbgBjAG8AZABpAG4AZwAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAAUwB5AHMAdABlAG0ALgBUAGUAeAB0AC4AVQBUAEYAOABFAG4AYwBvAGQAaQBuAGcADQAKAHAAdwBzAGgAIAAtAE4AbwBQAHIAbwBmAGkAbABlACAALQBOAG8AbgBJAG4AdABlAHIAYQBjAHQAaQB2AGUAIAAtAEMAbwBtAG0AYQBuAGQAIAAtAA0ACgBpAGYAKAAhACQAPwApACAAewAgAEUAeABpAHQAIAAmAHsAaQBmACgAJABMAEEAUwBUAEUAWABJAFQAQwBPAEQARQApACAAewAkAEwAQQBTAFQARQBYAEkAVABDAE8ARABFAH0AIABlAGwAcwBlACAAewAxAH0AfQAgAH0A"
+	)
+
+	testCases := map[string]struct {
+		shell    string
+		executor string
+		user     string
+		os       string
+		passFile bool
+
+		expectedError        error
+		expectedPassFile     bool
+		expectedCommand      string
+		expectedCmdLine      string
+		getExpectedArguments func(shell string, preCmds ...string) []string
+	}{
+		"powershell on docker-windows": {
+			shell:    SNPowershell,
+			executor: dockerWindowsExecutor,
+
+			expectedPassFile:     false,
+			expectedCommand:      SNPowershell,
+			getExpectedArguments: stdinCmdArgs,
+			expectedCmdLine:      powershellStdinExpectedLine,
+		},
+		"pwsh on docker-windows": {
+			shell:    SNPwsh,
+			executor: dockerWindowsExecutor,
+
+			expectedPassFile:     false,
+			expectedCommand:      SNPwsh,
+			getExpectedArguments: stdinCmdArgs,
+			expectedCmdLine:      pwshStdinExpectedLine,
+		},
+		"pwsh on docker": {
+			shell:    SNPwsh,
+			executor: "docker",
+
+			expectedPassFile:     false,
+			expectedCommand:      SNPwsh,
+			getExpectedArguments: stdinCmdArgs,
+			expectedCmdLine:      pwshStdinExpectedLine,
+		},
+		"pwsh on kubernetes": {
+			shell:    SNPwsh,
+			executor: "kubernetes",
+
+			expectedPassFile:     false,
+			expectedCommand:      SNPwsh,
+			getExpectedArguments: stdinCmdArgs,
+			expectedCmdLine:      pwshStdinExpectedLine,
+		},
+		"pwsh on shell": {
+			shell:    SNPwsh,
+			executor: "shell",
+
+			expectedPassFile:     false,
+			expectedCommand:      SNPwsh,
+			getExpectedArguments: stdinCmdArgs,
+			expectedCmdLine:      pwshStdinExpectedLine,
+		},
+		"pwsh on shell with custom user (linux)": {
+			shell:    SNPwsh,
+			executor: "shell",
+			user:     "custom",
+			os:       OSLinux,
+
+			expectedPassFile: false,
+			expectedCommand:  "su",
+			expectedCmdLine:  "su -s /usr/bin/pwsh custom -c " + pwshStdinExpectedLine,
+			getExpectedArguments: func(shell string, preCmds ...string) []string {
+				return []string{"-s", "/usr/bin/pwsh", "custom", "-c", SNPwsh + " " + strings.Join(stdinCmdArgs(shell), " ")}
+			},
+		},
+		"pwsh on shell with custom user (darwin)": {
+			shell:    SNPwsh,
+			executor: "shell",
+			user:     "custom",
+			os:       "darwin",
+
+			expectedPassFile: false,
+			expectedCommand:  "su",
+			expectedCmdLine:  "su custom -c " + pwshStdinExpectedLine,
+			getExpectedArguments: func(shell string, preCdms ...string) []string {
+				return []string{"custom", "-c", SNPwsh + " " + strings.Join(stdinCmdArgs(shell), " ")}
+			},
+		},
+		"pwsh on shell with custom user (windows)": {
+			shell:    SNPwsh,
+			executor: "shell",
+			user:     "custom",
+			os:       OSWindows,
+
+			expectedPassFile: false,
+			expectedCommand:  "su",
+			expectedCmdLine:  "su custom -c " + pwshStdinExpectedLine,
+			getExpectedArguments: func(shell string, preCmds ...string) []string {
+				return []string{"custom", "-c", SNPwsh + " " + strings.Join(stdinCmdArgs(shell), " ")}
+			},
+		},
+		"powershell on shell - FF_DISABLE_POWERSHELL_STDIN true": {
+			shell:    SNPowershell,
+			executor: "shell",
+			passFile: true,
+
+			expectedPassFile: true,
+			expectedCommand:  SNPowershell,
+			getExpectedArguments: func(_ string, _ ...string) []string {
+				return fileCmdArgs()
+			},
+			expectedCmdLine: "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File",
+		},
+		"powershell on shell - FF_DISABLE_POWERSHELL_STDIN false": {
+			shell:    SNPowershell,
+			executor: "shell",
+
+			expectedPassFile: false,
+			expectedCommand:  SNPowershell,
+			getExpectedArguments: func(_ string, _ ...string) []string {
+				return stdinCmdArgs(SNPowershell)
+			},
+			expectedCmdLine: powershellStdinExpectedLine,
+		},
+		"powershell on custom executor": {
+			shell:    SNPowershell,
+			executor: "custom",
+
+			expectedPassFile:     true,
+			expectedCommand:      SNPowershell,
+			getExpectedArguments: func(_ string, _ ...string) []string { return fileCmdArgs() },
+			expectedCmdLine:      "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File",
+		},
+	}
+
+	for tn, tc := range testCases {
+		t.Run(tn, func(t *testing.T) {
+			if tc.os != "" && tc.os != runtime.GOOS {
+				t.Skipf("test only runs on %s", tc.os)
+			}
+
+			shell := common.GetShell(tc.shell)
+			info := common.ShellScriptInfo{
+				Shell: tc.shell,
+				User:  tc.user,
+				Build: &common.Build{
+					Runner: &common.RunnerConfig{RunnerSettings: common.RunnerSettings{ProxyExec: func() *bool { v := false; return &v }()}},
+				},
+			}
+
+			if tc.passFile {
+				info.Build.Job.Variables = append(
+					info.Build.Job.Variables,
+					spec.Variable{
+						Key:   "FF_DISABLE_POWERSHELL_STDIN",
+						Value: "true",
+					},
+				)
+			}
+
+			info.Build.Runner.Executor = tc.executor
+
+			shellConfig, err := shell.GetConfiguration(info)
+			if tc.expectedError != nil {
+				require.Equal(t, tc.expectedError, err)
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, tc.getExpectedArguments(tc.shell), shellConfig.Arguments)
+			assert.Equal(t, tc.expectedCommand, shellConfig.Command)
+			assert.Equal(t, PowershellDockerCmd(tc.shell, common.LoginShell), shellConfig.DockerCommand)
+			assert.Equal(t, tc.expectedCmdLine, shellConfig.CmdLine)
+			assert.Equal(t, tc.expectedPassFile, shellConfig.PassFile)
+			assert.Equal(t, "ps1", shellConfig.Extension)
+		})
+	}
+}
+
+func TestPowershellCmdArgs(t *testing.T) {
+	for _, tc := range []string{SNPwsh, SNPowershell} {
+		t.Run(tc, func(t *testing.T) {
+			args := PowershellDockerCmd(tc, common.LoginShell)
+			assert.Equal(t, append([]string{tc}, stdinCmdArgs(tc)...), args)
+		})
+	}
+}
+
+func TestPowershellPathResolveOperations(t *testing.T) {
+	var templateReplacer = func(escaped string) func(string) string {
+		return func(tpl string) string {
+			return fmt.Sprintf(tpl, escaped)
+		}
+	}
+
+	testCases := map[string]struct {
+		op       func(path string, w *PsWriter)
+		template string
+		expected map[string]func(string) string
+	}{
+		"cd": {
+			op: func(path string, w *PsWriter) {
+				w.Cd(path)
+			},
+			template: "cd $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)\nif(!$?) { Exit &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }\n\n",
+			expected: map[string]func(string) string{
+				`path/name`: templateReplacer(`"path/name"`),
+				`\\unc\`:    templateReplacer(`"\\unc\"`),
+				`C:\path\`:  templateReplacer(`"C:\path\"`),
+			},
+		},
+		"mkdir": {
+			op: func(path string, w *PsWriter) {
+				w.MkDir(path)
+			},
+			template: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) | out-null\n",
+			expected: map[string]func(string) string{
+				`path/name`: templateReplacer(`"path/name"`),
+				`\\unc\`:    templateReplacer(`"\\unc\"`),
+				`C:\path\`:  templateReplacer(`"C:\path\"`),
+			},
+		},
+		"mktmpdir": {
+			op: func(path string, w *PsWriter) {
+				w.TemporaryPath = path
+				w.MkTmpDir("dir")
+			},
+			template: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) | out-null\n",
+			expected: map[string]func(string) string{
+				`path/name`: templateReplacer(`"path/name/dir"`),
+				`\\unc\`:    templateReplacer(`"\\unc\/dir"`),
+				`C:\path\`:  templateReplacer(`"C:\path\/dir"`),
+			},
+		},
+		"rm": {
+			op: func(path string, w *PsWriter) {
+				w.RmFile(path)
+			},
+			template: "if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Leaf) ) {\n  Remove-Item2 -Force $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)\n} elseif(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)) {\n  Remove-Item -Force $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)\n}\n\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"rmfilesrecursive": {
+			op: func(path string, w *PsWriter) {
+				w.RmFilesRecursive(path, "test")
+			},
+			template: "if(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Container) {\n  Get-ChildItem -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -Filter \"test\" -Recurse | ?{ -not $_.PSIsContainer } | ForEach-Object { Remove-Item -Force $_.FullName }\n}\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"rmdirsrecursive": {
+			op: func(path string, w *PsWriter) {
+				w.RmDirsRecursive(path, "test")
+			},
+			template: "if(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Container) {\n  Get-ChildItem -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -Filter \"test\" -Recurse | ?{ $_.PSIsContainer } | ForEach-Object { Remove-Item -Recurse -Force $_.FullName }\n}\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"rmdir": {
+			op: func(path string, w *PsWriter) {
+				w.RmDir(path)
+			},
+			template: "if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Container) ) {\n  Remove-Item2 -Force -Recurse $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)\n} elseif(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)) {\n  $item = Get-Item -Force $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v)\n  if ($item.LinkType -or -not $item.PSIsContainer) {\n    Remove-Item -Force $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -ErrorAction Stop\n  } else {\n    Get-ChildItem -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -Force -Recurse -ErrorAction Stop | Sort-Object { $_.FullName.Length } -Descending | Remove-Item -Force -ErrorAction Stop\n    Remove-Item -Force $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -ErrorAction Stop\n  }\n}\n\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"ifdirectory": {
+			op: func(path string, w *PsWriter) {
+				w.IfDirectory(path)
+			},
+			template: "if(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Container) {\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"iffile": {
+			op: func(path string, w *PsWriter) {
+				w.IfFile(path)
+			},
+			template: "if(Test-Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(%[1]v) -PathType Leaf) {\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`"path/name"`),
+				`\\unc\file`:   templateReplacer(`"\\unc\file"`),
+				`C:\path\file`: templateReplacer(`"C:\path\file"`),
+			},
+		},
+		"file variable": {
+			op: func(path string, w *PsWriter) {
+				w.TemporaryPath = path
+				w.Variable(spec.Variable{File: true, Key: "a key", Value: "foobar"})
+			},
+			template: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"%[1]v\") | out-null\n[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"%[1]v/a key\"), \"foobar\")\n${a key}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"%[1]v/a key\")\n${env:a key}=${a key}\n",
+			expected: map[string]func(string) string{
+				`path/name`:    templateReplacer(`path/name`),
+				`\\unc\file`:   templateReplacer(`\\unc\file`),
+				`C:\path\file`: templateReplacer(`C:\path\file`),
+			},
+		},
+	}
+
+	for tn, tc := range testCases {
+		for path, expected := range tc.expected {
+			for _, shell := range []string{SNPowershell, SNPwsh} {
+				t.Run(fmt.Sprintf("%s:%s: %s", shell, tn, path), func(t *testing.T) {
+					writer := &PsWriter{TemporaryPath: "\\temp", Shell: shell, EOL: "\n", resolvePaths: true}
+					tc.op(path, writer)
+					assert.Equal(t, expected(tc.template), writer.String())
+				})
+			}
+		}
+	}
+}
+
+func pwshExports(t *testing.T, shellInfo common.ShellScriptInfo) string {
+	t.Helper()
+
+	var ps *PowerShell
+	switch v := common.GetShell("pwsh").(type) {
+	case *PowerShell:
+		ps = v
+	case *ProxyExecShell:
+		ps = v.Shell.(*PowerShell)
+	default:
+		t.Fatalf("unexpected pwsh shell type %T", v)
+	}
+
+	w := NewPsWriter(ps, shellInfo)
+	(&AbstractShell{}).writeExports(w, shellInfo)
+	return w.String()
+}
+
+func TestPowershell_GenerateScript(t *testing.T) {
+	pwshShell := common.GetShell("pwsh")
+	eol := "\n"
+	switch v := pwshShell.(type) {
+	case *PowerShell:
+		eol = v.EOL
+	case *ProxyExecShell:
+		eol = v.Shell.(*PowerShell).EOL
+	}
+	shebang := ""
+
+	rmGitLabEnvScript := `` +
+		`$CurrentDirectory = (Resolve-Path ./).Path` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/gitlab_runner_env" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force "$CurrentDirectory/.tmp/gitlab_runner_env"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/gitlab_runner_env") {` + eol +
+		`  Remove-Item -Force "$CurrentDirectory/.tmp/gitlab_runner_env"` + eol +
+		`}` + eol + eol +
+		`$CurrentDirectory = (Resolve-Path ./).Path` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/masking.db" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force "$CurrentDirectory/.tmp/masking.db"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/masking.db") {` + eol +
+		`  Remove-Item -Force "$CurrentDirectory/.tmp/masking.db"` + eol +
+		`}`
+	cleanGitFiles := `` +
+		`$CurrentDirectory = (Resolve-Path ./).Path` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/.gitlab-runner.ext.conf" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force "$CurrentDirectory/.tmp/.gitlab-runner.ext.conf"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/.gitlab-runner.ext.conf") {` + eol +
+		`  Remove-Item -Force "$CurrentDirectory/.tmp/.gitlab-runner.ext.conf"` + eol +
+		`}` + eol +
+		`` + eol +
+		`$CurrentDirectory = (Resolve-Path ./).Path` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/.glr.gconf" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force "$CurrentDirectory/.tmp/.glr.gconf"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/.glr.gconf") {` + eol +
+		`  Remove-Item -Force "$CurrentDirectory/.tmp/.glr.gconf"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/index.lock" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/index.lock"` + eol +
+		`} elseif(Test-Path ".git/index.lock") {` + eol +
+		`  Remove-Item -Force ".git/index.lock"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/shallow.lock" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/shallow.lock"` + eol +
+		`} elseif(Test-Path ".git/shallow.lock") {` + eol +
+		`  Remove-Item -Force ".git/shallow.lock"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/HEAD.lock" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/HEAD.lock"` + eol +
+		`} elseif(Test-Path ".git/HEAD.lock") {` + eol +
+		`  Remove-Item -Force ".git/HEAD.lock"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/hooks/post-checkout" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/hooks/post-checkout"` + eol +
+		`} elseif(Test-Path ".git/hooks/post-checkout") {` + eol +
+		`  Remove-Item -Force ".git/hooks/post-checkout"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/config.lock" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/config.lock"` + eol +
+		`} elseif(Test-Path ".git/config.lock") {` + eol +
+		`  Remove-Item -Force ".git/config.lock"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if(Test-Path ".git/refs" -PathType Container) {` + eol +
+		`  Get-ChildItem -Path ".git/refs" -Filter "*.lock" -Recurse | ?{ -not $_.PSIsContainer } | ForEach-Object { Remove-Item -Force $_.FullName }` + eol +
+		`}` + eol
+
+	cleanGitConfigs := `` +
+		`$CurrentDirectory = (Resolve-Path ./).Path` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/git-template/config" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force "$CurrentDirectory/.tmp/git-template/config"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/git-template/config") {` + eol +
+		`  Remove-Item -Force "$CurrentDirectory/.tmp/git-template/config"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path "$CurrentDirectory/.tmp/git-template/hooks" -PathType Container) ) {` + eol +
+		`  Remove-Item2 -Force -Recurse "$CurrentDirectory/.tmp/git-template/hooks"` + eol +
+		`} elseif(Test-Path "$CurrentDirectory/.tmp/git-template/hooks") {` + eol +
+		`  $item = Get-Item -Force "$CurrentDirectory/.tmp/git-template/hooks"` + eol +
+		`  if ($item.LinkType -or -not $item.PSIsContainer) {` + eol +
+		`    Remove-Item -Force "$CurrentDirectory/.tmp/git-template/hooks" -ErrorAction Stop` + eol +
+		`  } else {` + eol +
+		`    Get-ChildItem -Path "$CurrentDirectory/.tmp/git-template/hooks" -Force -Recurse -ErrorAction Stop | Sort-Object { $_.FullName.Length } -Descending | Remove-Item -Force -ErrorAction Stop` + eol +
+		`    Remove-Item -Force "$CurrentDirectory/.tmp/git-template/hooks" -ErrorAction Stop` + eol +
+		`  }` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/config" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".git/config"` + eol +
+		`} elseif(Test-Path ".git/config") {` + eol +
+		`  Remove-Item -Force ".git/config"` + eol +
+		`}` + eol +
+		`` + eol +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".git/hooks" -PathType Container) ) {` + eol +
+		`  Remove-Item2 -Force -Recurse ".git/hooks"` + eol +
+		`} elseif(Test-Path ".git/hooks") {` + eol +
+		`  $item = Get-Item -Force ".git/hooks"` + eol +
+		`  if ($item.LinkType -or -not $item.PSIsContainer) {` + eol +
+		`    Remove-Item -Force ".git/hooks" -ErrorAction Stop` + eol +
+		`  } else {` + eol +
+		`    Get-ChildItem -Path ".git/hooks" -Force -Recurse -ErrorAction Stop | Sort-Object { $_.FullName.Length } -Descending | Remove-Item -Force -ErrorAction Stop` + eol +
+		`    Remove-Item -Force ".git/hooks" -ErrorAction Stop` + eol +
+		`  }` + eol +
+		`}`
+
+	cleanUidGidFiles := `` +
+		`if( (Get-Command -Name Remove-Item2 -Module NTFSSecurity -ErrorAction SilentlyContinue) -and (Test-Path ".gitlab-build-uid-gid" -PathType Leaf) ) {` + eol +
+		`  Remove-Item2 -Force ".gitlab-build-uid-gid"` + eol +
+		`} elseif(Test-Path ".gitlab-build-uid-gid") {` + eol +
+		`  Remove-Item -Force ".gitlab-build-uid-gid"` + eol +
+		`}`
+
+	clearGitCredentials := `` +
+		`${GIT_TERMINAL_PROMPT}="0"` + eol +
+		`${env:GIT_TERMINAL_PROMPT}=${GIT_TERMINAL_PROMPT}` + eol +
+		`${GCM_INTERACTIVE}="Never"` + eol +
+		`${env:GCM_INTERACTIVE}=${GCM_INTERACTIVE}` + eol +
+		`& {` + eol +
+		`  try {` + eol +
+		`    $tmpFile = Get-Item ([System.IO.Path]::GetTempFilename())` + eol +
+		`    [System.IO.File]::WriteAllText($tmpFile, 'url=https://test-hostname` + eol +
+		`username=gitlab-ci-token` + eol +
+		`')` + eol +
+		`    $CommandWithStdin = Start-Process -NoNewWindow -RedirectStandardInput $tmpFile -PassThru -Wait -FilePath 'git' -ArgumentList '-c','credential.interactive=never','credential','reject'` + eol +
+		`  } catch {` + eol +
+		`  } finally {` + eol +
+		`    if ($tmpFile) { Remove-Item -Force -ErrorAction SilentlyContinue -Path $tmpFile }` + eol +
+		`  }` + eol +
+		`}` + eol
+
+	if eol == "\n" {
+		shebang = "#!/usr/bin/env pwsh\n"
+	} else {
+		rmGitLabEnvScript = strings.ReplaceAll(rmGitLabEnvScript, `/`, `\`)
+		cleanGitFiles = strings.ReplaceAll(cleanGitFiles, `/`, `\`)
+		cleanGitConfigs = strings.ReplaceAll(cleanGitConfigs, `/`, `\`)
+	}
+
+	testCases := map[string]struct {
+		stage           common.BuildStage
+		updateShellInfo func(*common.ShellScriptInfo)
+		expectedFailure bool
+		expectedScript  func(common.ShellScriptInfo) string
+	}{
+		"prepare script": {
+			stage:           common.BuildStagePrepare,
+			expectedFailure: false,
+			expectedScript: func(shellInfo common.ShellScriptInfo) string {
+				return shebang + "& {" +
+					eol + eol +
+					fmt.Sprintf(pwshJSONInitializationScript, shellInfo.Shell) +
+					eol + eol +
+					`$ErrorActionPreference = "Stop"` + eol +
+					`echo "Running on $([Environment]::MachineName) via "Test Hostname"..."` +
+					eol +
+					strings.ReplaceAll(pwshCPUInfoScript, "\n", eol) + eol +
+					rmGitLabEnvScript +
+					eol + eol + eol +
+					"}" + eol + eol
+			},
+		},
+		"cleanup variables but not git config": {
+			stage: common.BuildStageCleanup,
+			updateShellInfo: func(shellInfo *common.ShellScriptInfo) {
+				shellInfo.Build.Runner.RunnerSettings.CleanGitConfig = &[]bool{false}[0]
+			},
+			expectedFailure: false,
+			expectedScript: func(shellInfo common.ShellScriptInfo) string {
+				return shebang + "& {" +
+					eol + eol +
+					fmt.Sprintf(pwshJSONInitializationScript, shellInfo.Shell) +
+					eol + eol +
+					`$ErrorActionPreference = "Stop"` + eol +
+					pwshExports(t, shellInfo) +
+					clearGitCredentials +
+					rmGitLabEnvScript +
+					eol + eol +
+					cleanGitFiles +
+					cleanUidGidFiles +
+					eol + eol + eol +
+					"}" + eol + eol
+			},
+		},
+		"cleanup variables and git config": {
+			stage:           common.BuildStageCleanup,
+			expectedFailure: false,
+			expectedScript: func(shellInfo common.ShellScriptInfo) string {
+				return shebang + "& {" +
+					eol + eol +
+					fmt.Sprintf(pwshJSONInitializationScript, shellInfo.Shell) +
+					eol + eol +
+					`$ErrorActionPreference = "Stop"` + eol +
+					pwshExports(t, shellInfo) +
+					clearGitCredentials +
+					rmGitLabEnvScript +
+					eol + eol +
+					cleanGitFiles +
+					cleanGitConfigs +
+					eol + eol +
+					cleanUidGidFiles +
+					eol + eol + eol +
+					"}" + eol + eol
+			},
+		},
+		"no script": {
+			stage:           "no_script",
+			expectedFailure: true,
+		},
+	}
+
+	for tn, tc := range testCases {
+		t.Run(tn, func(t *testing.T) {
+			shellInfo := common.ShellScriptInfo{
+				Shell:         "pwsh",
+				Type:          common.NormalShell,
+				RunnerCommand: "/usr/bin/gitlab-runner-helper",
+				Build: &common.Build{
+					Runner: &common.RunnerConfig{
+						RunnerSettings: common.RunnerSettings{
+							Executor: "kubernetes",
+							CloneURL: "https://test-hostname",
+						},
+					},
+					Hostname: "Test Hostname",
+				},
+			}
+			if u := tc.updateShellInfo; u != nil {
+				u(&shellInfo)
+			}
+
+			var expectedScript string
+			if s := tc.expectedScript; s != nil {
+				expectedScript = s(shellInfo)
+			}
+
+			script, err := pwshShell.GenerateScript(t.Context(), tc.stage, shellInfo)
+			assert.Equal(t, expectedScript, script)
+
+			if tc.expectedFailure {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestPowershell_GenerateSaveScript(t *testing.T) {
+	path := "path"
+	shellInfo := common.ShellScriptInfo{
+		Shell:         "pwsh",
+		Type:          common.NormalShell,
+		RunnerCommand: "/usr/bin/gitlab-runner-helper",
+		Build: &common.Build{
+			Runner: &common.RunnerConfig{RunnerSettings: common.RunnerSettings{ProxyExec: func() *bool { v := false; return &v }()}},
+		},
+	}
+	shellInfo.Build.Runner.Executor = "kubernetes"
+	shellInfo.Build.Hostname = "Test Hostname"
+
+	eol := "\n"
+	switch v := common.GetShell("pwsh").(type) {
+	case *PowerShell:
+		eol = v.EOL
+	case *ProxyExecShell:
+		eol = v.Shell.(*PowerShell).EOL
+	}
+
+	testCases := map[string]struct {
+		info            common.ShellScriptInfo
+		script          string
+		expectedFailure bool
+		expectedScript  string
+	}{
+		"normal script": {
+			info:   shellInfo,
+			script: `&{ echo "Display special characters () {} <> [] \ | ;"}`,
+			expectedScript: "& {" + eol + eol +
+				"$in =\"JnsgZWNobyAiRGlzcGxheSBzcGVjaWFsIGNoYXJhY3RlcnMgKCkge30gPD4gW10gXCB8IDsifQ==\"" + eol +
+				"$customEncoding = New-Object System.Text.UTF8Encoding $True" + eol +
+				"$sw = [System.IO.StreamWriter]::new(\"path\", $False, $customEncoding)" + eol +
+				"$sw.Write([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($in)))" + eol +
+				"$sw.Flush()" + eol + "$sw.Close()" + eol + eol + eol +
+				"}" + eol + eol,
+		},
+		"echo unicode script": {
+			script: "echo \"`“ `“ `” `” `„ ‘ ’ ‚ ‛ ‘ ’„",
+			info:   shellInfo,
+			expectedScript: "& {" + eol + eol +
+				"$in =\"ZWNobyAiYOKAnCBg4oCcIGDigJ0gYOKAnSBg4oCeIOKAmCDigJkg4oCaIOKAmyDigJgg4oCZ4oCe\"" + eol +
+				"$customEncoding = New-Object System.Text.UTF8Encoding $True" + eol +
+				"$sw = [System.IO.StreamWriter]::new(\"path\", $False, $customEncoding)" + eol +
+				"$sw.Write([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($in)))" + eol +
+				"$sw.Flush()" + eol + "$sw.Close()" + eol + eol + eol +
+				"}" + eol + eol,
+		},
+		"echo script": {
+			script: "echo normal string",
+			info:   shellInfo,
+			expectedScript: "& {" + eol + eol +
+				"$in =\"ZWNobyBub3JtYWwgc3RyaW5n\"" + eol +
+				"$customEncoding = New-Object System.Text.UTF8Encoding $True" + eol +
+				"$sw = [System.IO.StreamWriter]::new(\"path\", $False, $customEncoding)" + eol +
+				"$sw.Write([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($in)))" + eol +
+				"$sw.Flush()" + eol + "$sw.Close()" + eol + eol + eol +
+				"}" + eol + eol,
+		},
+	}
+
+	for tn, tc := range testCases {
+		t.Run(tn, func(t *testing.T) {
+			script, err := common.GetShell("pwsh").GenerateSaveScript(tc.info, path, tc.script)
+			assert.Equal(t, tc.expectedScript, script)
+			if tc.expectedFailure {
+				assert.Error(t, err)
+			}
+		})
+	}
+}
+
+func Test_PsWriter_isTmpFile(t *testing.T) {
+	tmpDir := "/foo/bar"
+	bw := PsWriter{TemporaryPath: tmpDir}
+
+	tests := map[string]struct {
+		path string
+		want bool
+	}{
+		"tmp file var":     {path: path.Join(tmpDir, "BAZ"), want: true},
+		"not tmp file var": {path: "bla bla bla", want: false},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, tt.want, bw.isTmpFile(tt.path))
+		})
+	}
+}
+
+func Test_PsWriter_cleanPath(t *testing.T) {
+	tests := map[string]struct {
+		path, wantLinux, wantWindows string
+	}{
+		"relative path": {
+			path:        "foo/bar/KEY",
+			wantLinux:   "$CurrentDirectory/foo/bar/KEY",
+			wantWindows: "$CurrentDirectory\\foo\\bar\\KEY",
+		},
+		"absolute path": {
+			path:        "/foo/bar/KEY",
+			wantLinux:   "/foo/bar/KEY",
+			wantWindows: "$CurrentDirectory\\foo\\bar\\KEY",
+		},
+		"absolute path with drive": {
+			path:        "C:/foo/bar/KEY",
+			wantLinux:   "$CurrentDirectory/C:/foo/bar/KEY",
+			wantWindows: "C:\\foo\\bar\\KEY",
+		},
+	}
+
+	bw := PsWriter{TemporaryPath: "foo/bar"}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			got := bw.cleanPath(tt.path)
+
+			if runtime.GOOS == OSWindows {
+				assert.Equal(t, tt.wantWindows, got)
+			} else {
+				assert.Equal(t, tt.wantLinux, got)
+			}
+		})
+	}
+}
+
+// nolint:lll
+func Test_PsWriter_Variable(t *testing.T) {
+	tests := map[string]struct {
+		variable               spec.Variable
+		writer                 PsWriter
+		wantLinux, wantWindows string
+	}{
+		"file var, relative path": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "foo/bar"},
+			wantLinux:   "$CurrentDirectory = (Resolve-Path ./).PathNew-Item -ItemType directory -Force -Path \"foo/bar\" | out-null[System.IO.File]::WriteAllText(\"$CurrentDirectory/foo/bar/KEY\", \"the secret\")${KEY}=\"$CurrentDirectory/foo/bar/KEY\"${env:KEY}=${KEY}",
+			wantWindows: "$CurrentDirectory = (Resolve-Path .\\).PathNew-Item -ItemType directory -Force -Path \"foo\\bar\" | out-null[System.IO.File]::WriteAllText(\"$CurrentDirectory\\foo\\bar\\KEY\", \"the secret\")${KEY}=\"$CurrentDirectory\\foo\\bar\\KEY\"${env:KEY}=${KEY}",
+		},
+		"file var, absolute path": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "/foo/bar"},
+			wantLinux:   "New-Item -ItemType directory -Force -Path \"/foo/bar\" | out-null[System.IO.File]::WriteAllText(\"/foo/bar/KEY\", \"the secret\")${KEY}=\"/foo/bar/KEY\"${env:KEY}=${KEY}",
+			wantWindows: "$CurrentDirectory = (Resolve-Path .\\).PathNew-Item -ItemType directory -Force -Path \"\\foo\\bar\" | out-null[System.IO.File]::WriteAllText(\"$CurrentDirectory\\foo\\bar\\KEY\", \"the secret\")${KEY}=\"$CurrentDirectory\\foo\\bar\\KEY\"${env:KEY}=${KEY}",
+		},
+		"file var, absolute path with drive": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "C:/foo/bar"},
+			wantLinux:   "$CurrentDirectory = (Resolve-Path ./).PathNew-Item -ItemType directory -Force -Path \"C:/foo/bar\" | out-null[System.IO.File]::WriteAllText(\"$CurrentDirectory/C:/foo/bar/KEY\", \"the secret\")${KEY}=\"$CurrentDirectory/C:/foo/bar/KEY\"${env:KEY}=${KEY}",
+			wantWindows: "New-Item -ItemType directory -Force -Path \"C:\\foo\\bar\" | out-null[System.IO.File]::WriteAllText(\"C:\\foo\\bar\\KEY\", \"the secret\")${KEY}=\"C:\\foo\\bar\\KEY\"${env:KEY}=${KEY}",
+		},
+		"tmp file var, relative path": {
+			variable:    spec.Variable{Key: "KEY", Value: "foo/bar/KEY2"},
+			writer:      PsWriter{TemporaryPath: "foo/bar"},
+			wantLinux:   "$CurrentDirectory = (Resolve-Path ./).Path${KEY}=\"`$CurrentDirectory/foo/bar/KEY2\"${env:KEY}=${KEY}",
+			wantWindows: "$CurrentDirectory = (Resolve-Path .\\).Path${KEY}=\"`$CurrentDirectory\\foo\\bar\\KEY2\"${env:KEY}=${KEY}",
+		},
+		"tmp file var, absolute path": {
+			variable:    spec.Variable{Key: "KEY", Value: "/foo/bar/KEY2"},
+			writer:      PsWriter{TemporaryPath: "/foo/bar"},
+			wantLinux:   "${KEY}=\"/foo/bar/KEY2\"${env:KEY}=${KEY}",
+			wantWindows: "$CurrentDirectory = (Resolve-Path .\\).Path${KEY}=\"`$CurrentDirectory\\foo\\bar\\KEY2\"${env:KEY}=${KEY}",
+		},
+		"regular var": {
+			variable:    spec.Variable{Key: "KEY", Value: "VALUE"},
+			writer:      PsWriter{TemporaryPath: "C:/foo/bar"},
+			wantLinux:   "${KEY}=\"VALUE\"${env:KEY}=${KEY}",
+			wantWindows: "${KEY}=\"VALUE\"${env:KEY}=${KEY}",
+		},
+		"regular var with dashes": {
+			variable:    spec.Variable{Key: "Test-Variable", Value: "value"},
+			writer:      PsWriter{TemporaryPath: "C:/foo/bar"},
+			wantLinux:   "${Test-Variable}=\"value\"${env:Test-Variable}=${Test-Variable}",
+			wantWindows: "${Test-Variable}=\"value\"${env:Test-Variable}=${Test-Variable}",
+		},
+
+		"file var, relative path, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "foo/bar", resolvePaths: true},
+			wantLinux:   "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar/KEY\")${env:KEY}=${KEY}",
+			wantWindows: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"foo/bar/KEY\")${env:KEY}=${KEY}",
+		},
+		"file var, absolute path, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "/foo/bar", resolvePaths: true},
+			wantLinux:   "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar/KEY\")${env:KEY}=${KEY}",
+			wantWindows: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"/foo/bar/KEY\")${env:KEY}=${KEY}",
+		},
+		"file var, absolute path with drive, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "the secret", File: true},
+			writer:      PsWriter{TemporaryPath: "C:/foo/bar", resolvePaths: true},
+			wantLinux:   "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar/KEY\")${env:KEY}=${KEY}",
+			wantWindows: "New-Item -ItemType directory -Force -Path $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar\") | out-null[System.IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar/KEY\"), \"the secret\")${KEY}=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(\"C:/foo/bar/KEY\")${env:KEY}=${KEY}",
+		},
+		"tmp file var, relative path, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "foo/bar/KEY2"},
+			writer:      PsWriter{TemporaryPath: "foo/bar", resolvePaths: true},
+			wantLinux:   "${KEY}=\"foo/bar/KEY2\"${env:KEY}=${KEY}",
+			wantWindows: "${KEY}=\"foo/bar/KEY2\"${env:KEY}=${KEY}",
+		},
+		"tmp file var, absolute path, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "/foo/bar/KEY2"},
+			writer:      PsWriter{TemporaryPath: "/foo/bar", resolvePaths: true},
+			wantLinux:   "${KEY}=\"/foo/bar/KEY2\"${env:KEY}=${KEY}",
+			wantWindows: "${KEY}=\"/foo/bar/KEY2\"${env:KEY}=${KEY}",
+		},
+		"tmp file var, absolute path with drive, resolvePaths": {
+			variable:    spec.Variable{Key: "KEY", Value: "C:/foo/bar/KEY2"},
+			writer:      PsWriter{TemporaryPath: "C:/foo/bar", resolvePaths: true},
+			wantLinux:   "${KEY}=\"C:/foo/bar/KEY2\"${env:KEY}=${KEY}",
+			wantWindows: "${KEY}=\"C:/foo/bar/KEY2\"${env:KEY}=${KEY}",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tt.writer.Variable(tt.variable)
+
+			if runtime.GOOS == OSWindows {
+				assert.Equal(t, tt.wantWindows, tt.writer.String())
+			} else {
+				assert.Equal(t, tt.wantLinux, tt.writer.String())
+			}
+		})
+	}
+}
+
+func Test_PsWriter_DotEnvVariables(t *testing.T) {
+	templateLinux := "New-Item -ItemType directory -Force -Path \"foo/bar\" | out-null$CurrentDirectory = (Resolve-Path ./).Path[System.IO.File]::WriteAllText(\"$CurrentDirectory/foo/bar/test\", @\"\n%s\n\"@)"
+	templateWindows := "New-Item -ItemType directory -Force -Path \"foo\\bar\" | out-null$CurrentDirectory = (Resolve-Path .\\).Path[System.IO.File]::WriteAllText(\"$CurrentDirectory\\foo\\bar\\test\", @\"\n%s\n\"@)"
+
+	tests := map[string]struct {
+		variables map[string]string
+		writer    PsWriter
+		want      string
+	}{
+		"single key": {
+			variables: map[string]string{"KEY": "VALUE"},
+			writer:    PsWriter{TemporaryPath: "foo/bar"},
+			want:      "KEY=\"VALUE\"\n",
+		},
+		"multiple keys": {
+			variables: map[string]string{
+				"KEY1": "FOO\nBAR",
+				"KEY2": "TEST",
+			},
+			writer: PsWriter{TemporaryPath: "foo/bar"},
+			want: `KEY1="FOO\nBAR"
+KEY2="TEST"
+`,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			tt.writer.DotEnvVariables("test", tt.variables)
+
+			expected := fmt.Sprintf(templateLinux, tt.want)
+			if runtime.GOOS == OSWindows {
+				expected = fmt.Sprintf(templateWindows, tt.want)
+			}
+
+			assert.Equal(t, expected, tt.writer.String())
+		})
+	}
+}
+
+func TestPowershellEntrypointCommand(t *testing.T) {
+	// utf8 -> utf16 & base64 encoded
+	// 	$OutputEncoding = [console]::InputEncoding = [console]::OutputEncoding = New-Object System.Text.UTF8Encoding\r
+	// 	pwsh -NoProfile -NonInteractive -Command -\r
+	// 	if(!$?) { Exit &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }
+	encodedCommandBlobWithoutProbe := "JABPAHUAdABwAHUAdABFAG4AYwBvAGQAaQBuAGcAIAA9ACAAWwBjAG8AbgBzAG8AbABlAF0AOgA6AEkAbgBwAHUAdABFAG4AYwBvAGQAaQBuAGcAIAA9ACAAWwBjAG8AbgBzAG8AbABlAF0AOgA6AE8AdQB0AHAAdQB0AEUAbgBjAG8AZABpAG4AZwAgAD0AIABOAGUAdwAtAE8AYgBqAGUAYwB0ACAAUwB5AHMAdABlAG0ALgBUAGUAeAB0AC4AVQBUAEYAOABFAG4AYwBvAGQAaQBuAGcADQAKAHAAdwBzAGgAIAAtAE4AbwBQAHIAbwBmAGkAbABlACAALQBOAG8AbgBJAG4AdABlAHIAYQBjAHQAaQB2AGUAIAAtAEMAbwBtAG0AYQBuAGQAIAAtAA0ACgBpAGYAKAAhACQAPwApACAAewAgAEUAeABpAHQAIAAmAHsAaQBmACgAJABMAEEAUwBUAEUAWABJAFQAQwBPAEQARQApACAAewAkAEwAQQBTAFQARQBYAEkAVABDAE8ARABFAH0AIABlAGwAcwBlACAAewAxAH0AfQAgAH0A"
+
+	// utf8 -> utf16 & base64 encoded
+	// 	Out-File -Force -FilePath 'someFile'\r
+	// 	$OutputEncoding = [console]::InputEncoding = [console]::OutputEncoding = New-Object System.Text.UTF8Encoding\r
+	// 	pwsh -NoProfile -NonInteractive -Command -\r
+	// 	if(!$?) { Exit &{if($LASTEXITCODE) {$LASTEXITCODE} else {1}} }
+	encodedCommandBlobWithProbe := "TwB1AHQALQBGAGkAbABlACAALQBGAG8AcgBjAGUAIAAtAEYAaQBsAGUAUABhAHQAaAAgACcAcwBvAG0AZQBGAGkAbABlACcADQAKACQATwB1AHQAcAB1AHQARQBuAGMAbwBkAGkAbgBnACAAPQAgAFsAYwBvAG4AcwBvAGwAZQBdADoAOgBJAG4AcAB1AHQARQBuAGMAbwBkAGkAbgBnACAAPQAgAFsAYwBvAG4AcwBvAGwAZQBdADoAOgBPAHUAdABwAHUAdABFAG4AYwBvAGQAaQBuAGcAIAA9ACAATgBlAHcALQBPAGIAagBlAGMAdAAgAFMAeQBzAHQAZQBtAC4AVABlAHgAdAAuAFUAVABGADgARQBuAGMAbwBkAGkAbgBnAA0ACgBwAHcAcwBoACAALQBOAG8AUAByAG8AZgBpAGwAZQAgAC0ATgBvAG4ASQBuAHQAZQByAGEAYwB0AGkAdgBlACAALQBDAG8AbQBtAGEAbgBkACAALQANAAoAaQBmACgAIQAkAD8AKQAgAHsAIABFAHgAaQB0ACAAJgB7AGkAZgAoACQATABBAFMAVABFAFgASQBUAEMATwBEAEUAKQAgAHsAJABMAEEAUwBUAEUAWABJAFQAQwBPAEQARQB9ACAAZQBsAHMAZQAgAHsAMQB9AH0AIAB9AA=="
+
+	tests := map[string]map[string]struct {
+		probeFile       string
+		expectedCommand []string
+	}{
+		SNPwsh: {
+			"no probe": {
+				expectedCommand: []string{"pwsh", "-NoProfile", "-NoLogo", "-InputFormat", "text", "-OutputFormat", "text", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodedCommandBlobWithoutProbe},
+			},
+			"with probe": {
+				probeFile:       "someFile",
+				expectedCommand: []string{"pwsh", "-NoProfile", "-NoLogo", "-InputFormat", "text", "-OutputFormat", "text", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encodedCommandBlobWithProbe},
+			},
+		},
+		SNPowershell: {
+			"no probe": {
+				expectedCommand: []string{"powershell", "-NoProfile", "-NoLogo", "-InputFormat", "text", "-OutputFormat", "text", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "-"},
+			},
+			"with probe": {
+				probeFile:       "someFile",
+				expectedCommand: []string{"powershell", "-NoProfile", "-NoLogo", "-InputFormat", "text", "-OutputFormat", "text", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", "Out-File -Force -FilePath 'someFile'; powershell -NoProfile -Command -"},
+			},
+		},
+	}
+
+	for shellName, testCases := range tests {
+		t.Run(shellName, func(t *testing.T) {
+			for tn, tc := range testCases {
+				t.Run(tn, func(t *testing.T) {
+					shell := common.GetShell(shellName)
+					unusedShellScriptInfo := common.ShellScriptInfo{}
+
+					actualCommand := shell.GetEntrypointCommand(unusedShellScriptInfo, tc.probeFile)
+					assert.Equal(t, tc.expectedCommand, actualCommand)
+				})
+			}
+		})
+	}
+}
+
+func TestPowershell_ExportRaw(t *testing.T) {
+	testCases := map[string]struct {
+		name        string
+		value       string
+		wantLinux   string
+		wantWindows string
+	}{
+		"simple key": {
+			name:        "SIMPLE_VAR",
+			value:       "value",
+			wantLinux:   "${SIMPLE_VAR}=\"value\"${env:SIMPLE_VAR}=\"value\"",
+			wantWindows: "${SIMPLE_VAR}=\"value\"${env:SIMPLE_VAR}=\"value\"",
+		},
+		"key with dashes": {
+			name:        "Test-Variable",
+			value:       "value",
+			wantLinux:   "${Test-Variable}=\"value\"${env:Test-Variable}=\"value\"",
+			wantWindows: "${Test-Variable}=\"value\"${env:Test-Variable}=\"value\"",
+		},
+		"key with single quotes": {
+			name:        "VAR'WITH'QUOTES",
+			value:       "value",
+			wantLinux:   "${VAR'WITH'QUOTES}=\"value\"${env:VAR'WITH'QUOTES}=\"value\"",
+			wantWindows: "${VAR'WITH'QUOTES}=\"value\"${env:VAR'WITH'QUOTES}=\"value\"",
+		},
+		"key with dashes and single quotes": {
+			name:        "MY-VAR'NAME",
+			value:       "value",
+			wantLinux:   "${MY-VAR'NAME}=\"value\"${env:MY-VAR'NAME}=\"value\"",
+			wantWindows: "${MY-VAR'NAME}=\"value\"${env:MY-VAR'NAME}=\"value\"",
+		},
+		"key with multiple dashes": {
+			name:        "MY-VAR-NAME-HERE",
+			value:       "value",
+			wantLinux:   "${MY-VAR-NAME-HERE}=\"value\"${env:MY-VAR-NAME-HERE}=\"value\"",
+			wantWindows: "${MY-VAR-NAME-HERE}=\"value\"${env:MY-VAR-NAME-HERE}=\"value\"",
+		},
+		"key with single quote at end": {
+			name:        "QUOTED_VAR'",
+			value:       "value",
+			wantLinux:   "${QUOTED_VAR'}=\"value\"${env:QUOTED_VAR'}=\"value\"",
+			wantWindows: "${QUOTED_VAR'}=\"value\"${env:QUOTED_VAR'}=\"value\"",
+		},
+		"key with dash and single quote mixed": {
+			name:        "VAR-'MIX'ED-NAME",
+			value:       "value",
+			wantLinux:   "${VAR-'MIX'ED-NAME}=\"value\"${env:VAR-'MIX'ED-NAME}=\"value\"",
+			wantWindows: "${VAR-'MIX'ED-NAME}=\"value\"${env:VAR-'MIX'ED-NAME}=\"value\"",
+		},
+	}
+
+	for tn, tc := range testCases {
+		t.Run(tn, func(t *testing.T) {
+			writer := &PsWriter{TemporaryPath: "C:/foo/bar"}
+			writer.ExportRaw(tc.name, tc.value)
+
+			if runtime.GOOS == OSWindows {
+				assert.Equal(t, tc.wantWindows, writer.String())
+			} else {
+				assert.Equal(t, tc.wantLinux, writer.String())
+			}
+		})
+	}
+}
+
+// TestPowershell_ExportRaw_PreservesRuntimePath guards why GIT_CONFIG_GLOBAL is
+// exported via ExportRaw(TmpFile(...)): for a relative builds dir TmpFile injects
+// a runtime "$CurrentDirectory", and ExportRaw must keep the "$" unescaped.
+// Variable() would escape it to "`$" (see "tmp file var, relative path" in
+// Test_PsWriter_Variable), yielding a literal git could not resolve.
+func TestPowershell_ExportRaw_PreservesRuntimePath(t *testing.T) {
+	writer := &PsWriter{TemporaryPath: "builds/proj.tmp", Shell: SNPwsh, EOL: "\n"}
+
+	writer.ExportRaw("GIT_CONFIG_GLOBAL", writer.TmpFile(globalGitConfigSeedFile))
+
+	got := writer.String()
+	assert.Contains(t, got, "$CurrentDirectory", "the runtime path-resolution expression must be present")
+	assert.NotContains(t, got, "`$", "the '$' must not be escaped, or PowerShell would render a literal $CurrentDirectory")
+	assert.Contains(t, got, globalGitConfigSeedFile, "the exported value must point at the seed file")
+}
+
+// TestPowershell_IfFileReadable pins the guard emitted around optional git
+// config includes. The OpenRead attempt probes actual readability where
+// Test-Path only proves existence (a deny-read ACL passes Test-Path and
+// then kills git at read time), and the try/catch keeps the probe silent
+// under the pwsh $ErrorActionPreference = "Stop" prologue, including the
+// "Cannot find drive" error of the runtime-resolver branch. The path goes
+// through resolvePath like IfFile and IfDirectory, so the non-resolver
+// expectations are filepath.FromSlash dependent, and a runtime $HOME must
+// stay unescaped in both modes. .NET path APIs take wildcard characters
+// literally, so bracketed paths need no special casing. Mixed separators
+// are the shape $HOME/.gitconfig actually takes once the shell expands
+// $HOME on Windows, and both branches must leave them alone rather than
+// mangle the value.
+func TestPowershell_IfFileReadable(t *testing.T) {
+	tests := map[string]struct {
+		resolvePaths bool
+		path         string
+		expected     string
+	}{
+		"runtime HOME reference": {
+			path:     "$HOME/.gitconfig",
+			expected: `if($(try { [System.IO.File]::OpenRead("` + filepath.FromSlash("$HOME/.gitconfig") + `").Dispose(); $true } catch { $false })) {` + "\n",
+		},
+		"wildcard characters stay literal": {
+			path:     "C:/Users/brack[1]/.gitconfig",
+			expected: `if($(try { [System.IO.File]::OpenRead("` + filepath.FromSlash("C:/Users/brack[1]/.gitconfig") + `").Dispose(); $true } catch { $false })) {` + "\n",
+		},
+		"mixed separators": {
+			path:     `C:\Users\someone/.gitconfig`,
+			expected: `if($(try { [System.IO.File]::OpenRead("` + filepath.FromSlash(`C:\Users\someone/.gitconfig`) + `").Dispose(); $true } catch { $false })) {` + "\n",
+		},
+		"runtime path resolver": {
+			resolvePaths: true,
+			path:         "$HOME/.gitconfig",
+			expected:     `if($(try { [System.IO.File]::OpenRead($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("$HOME/.gitconfig")).Dispose(); $true } catch { $false })) {` + "\n",
+		},
+		"mixed separators with the runtime path resolver": {
+			resolvePaths: true,
+			path:         `C:\Users\someone/.gitconfig`,
+			expected:     `if($(try { [System.IO.File]::OpenRead($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath("C:\Users\someone/.gitconfig")).Dispose(); $true } catch { $false })) {` + "\n",
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			writer := &PsWriter{Shell: SNPwsh, EOL: "\n", resolvePaths: tc.resolvePaths}
+			writer.IfFileReadable(tc.path)
+
+			assert.Equal(t, tc.expected, writer.String())
+		})
+	}
+}
+
+func TestPowershell_CPUInfoMessage(t *testing.T) {
+	pwsh, err := exec.LookPath(SNPwsh)
+	if err != nil {
+		t.Skip("requires pwsh")
+	}
+
+	// The test points the script at fixtures by rewriting these literals. Pointing it at a
+	// missing registry key makes it fall back to the cpuinfo fixture on Windows as well.
+	const (
+		cpuKey      = `'HKLM:\HARDWARE\DESCRIPTION\System\CentralProcessor\0'`
+		missingKey  = `'HKLM:\SOFTWARE\GitLab\gitlab-runner-test\missing'`
+		cpuinfoPath = "'/proc/cpuinfo'"
+	)
+	require.Contains(t, pwshCPUInfoScript, cpuKey)
+	require.Contains(t, pwshCPUInfoScript, cpuinfoPath)
+
+	tests := map[string]struct {
+		windowsOnly bool
+		cpuinfo     string // no cpuinfo file is created when empty
+		expected    string
+	}{
+		"model from cpuinfo": {
+			cpuinfo:  "model name\t: AMD EPYC 7B12\n",
+			expected: "Running on CPU: AMD EPYC 7B12",
+		},
+		"no registry key and no cpuinfo": {
+			expected: "Running on CPU: unknown",
+		},
+		"model from registry": {
+			windowsOnly: true,
+		},
+	}
+
+	for tn, tc := range tests {
+		t.Run(tn, func(t *testing.T) {
+			if tc.windowsOnly && runtime.GOOS != OSWindows {
+				t.Skip("the registry exists only on Windows")
+			}
+
+			cpuinfo := filepath.Join(t.TempDir(), "cpuinfo")
+			if tc.cpuinfo != "" {
+				require.NoError(t, os.WriteFile(cpuinfo, []byte(tc.cpuinfo), 0o644))
+			}
+
+			script := strings.Replace(pwshCPUInfoScript, cpuinfoPath, "'"+cpuinfo+"'", 1)
+			if !tc.windowsOnly {
+				script = strings.Replace(script, cpuKey, missingKey, 1)
+			}
+
+			// Run the message the way the job script does: with errors stopping the script.
+			var stderr strings.Builder
+			cmd := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-Command",
+				`$ErrorActionPreference = "Stop"`+"\n"+script+"\n")
+			cmd.Stderr = &stderr
+			out, err := cmd.Output()
+			require.NoError(t, err)
+			assert.Empty(t, stderr.String(), "the probe must not write to stderr")
+
+			line := strings.TrimRight(string(out), "\r\n")
+			if tc.windowsOnly {
+				assert.NotEqual(t, "Running on CPU: unknown", line)
+				assert.True(t, strings.HasPrefix(line, "Running on CPU: "), "unexpected line: %q", line)
+			} else {
+				assert.Equal(t, tc.expected, line)
+			}
+		})
+	}
+}

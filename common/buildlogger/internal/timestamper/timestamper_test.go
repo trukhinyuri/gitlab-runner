@@ -1,0 +1,275 @@
+//go:build !integration
+
+package timestamper
+
+import (
+	"bytes"
+	"io"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func setupDummyTime() func() {
+	oldNow := now
+
+	pretend, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00.020010Z")
+	now = func() time.Time {
+		pretend = pretend.Add(time.Hour)
+		return pretend.UTC()
+	}
+
+	return func() {
+		now = oldNow
+	}
+}
+
+// nolint:errcheck
+func writeLines(w io.Writer) {
+	w.Write([]byte("PREFIX This is the beginning of a new line\n"))
+	w.Write([]byte("PREFIX This is a split "))
+	w.Write([]byte("up "))
+	w.Write([]byte("line\n"))
+	w.Write([]byte("PREFIX Progress bar: "))
+
+	for range 10 {
+		w.Write([]byte(".\r"))
+	}
+
+	w.Write([]byte("Done.\r\n"))
+	w.Write([]byte("PREFIX Another windows new-line\r\n"))
+
+	w.Write([]byte("PREFIX multiple\nnew\nlines\nin\none\n"))
+
+	w.Write([]byte("\nstart"))
+	w.Write([]byte("\nend\n"))
+
+	w.Write([]byte("PREFIX Eat carriages\r\r\r\r\r\r\r\n"))
+	w.Write([]byte("PREFIX This is across\ntwo lines\n"))
+	w.Write([]byte("PREFIX The end"))
+}
+
+func TestWithTimestamps(t *testing.T) {
+	// reset local
+	local := time.Local
+	defer func() {
+		time.Local = local
+	}()
+
+	for _, tz := range []string{"UTC", "Africa/Cairo", "US/Alaska"} {
+		t.Run(tz, func(t *testing.T) {
+			// change timezone
+			loc, _ := time.LoadLocation(tz)
+			time.Local = loc
+
+			buf := new(bytes.Buffer)
+
+			defer setupDummyTime()()
+
+			w := New(buf, StderrType, 255, true)
+			writeLines(w)
+			require.NoError(t, w.Close())
+
+			expected := []string{
+				"2021-01-01T01:00:00.020010Z ffE PREFIX This is the beginning of a new line\n",
+				"2021-01-01T02:00:00.020010Z ffE PREFIX This is a split up line\n",
+				"2021-01-01T03:00:00.020010Z ffE PREFIX Progress bar: .\r\n",
+				"2021-01-01T04:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T05:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T06:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T07:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T08:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T09:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T10:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T11:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T12:00:00.020010Z ffE+.\r\n",
+				"2021-01-01T13:00:00.020010Z ffE+Done.\r\n",
+				"2021-01-01T14:00:00.020010Z ffE PREFIX Another windows new-line\r\n",
+				"2021-01-01T15:00:00.020010Z ffE PREFIX multiple\n",
+				"2021-01-01T16:00:00.020010Z ffE new\n",
+				"2021-01-01T17:00:00.020010Z ffE lines\n",
+				"2021-01-01T18:00:00.020010Z ffE in\n",
+				"2021-01-01T19:00:00.020010Z ffE one\n",
+				"2021-01-01T20:00:00.020010Z ffE \n",
+				"2021-01-01T21:00:00.020010Z ffE start\n",
+				"2021-01-01T22:00:00.020010Z ffE end\n",
+				"2021-01-01T23:00:00.020010Z ffE PREFIX Eat carriages\r\r\r\r\r\r\r\n",
+				"2021-01-02T00:00:00.020010Z ffE PREFIX This is across\n",
+				"2021-01-02T01:00:00.020010Z ffE two lines\n",
+				"2021-01-02T02:00:00.020010Z ffE PREFIX The end\n",
+			}
+
+			assert.Equal(t, strings.Join(expected, ""), buf.String())
+		})
+	}
+}
+
+func TestWithoutTimestamp(t *testing.T) {
+	buf := new(bytes.Buffer)
+
+	defer setupDummyTime()()
+
+	w := New(buf, StderrType, 255, false)
+	writeLines(w)
+	require.NoError(t, w.Close())
+
+	expected := []string{
+		"ffE PREFIX This is the beginning of a new line\n",
+		"ffE PREFIX This is a split up line\n",
+		"ffE PREFIX Progress bar: .\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+.\r\n",
+		"ffE+Done.\r\n",
+		"ffE PREFIX Another windows new-line\r\n",
+		"ffE PREFIX multiple\n",
+		"ffE new\n",
+		"ffE lines\n",
+		"ffE in\n",
+		"ffE one\n",
+		"ffE \n",
+		"ffE start\n",
+		"ffE end\n",
+		"ffE PREFIX Eat carriages\r\r\r\r\r\r\r\n",
+		"ffE PREFIX This is across\n",
+		"ffE two lines\n",
+		"ffE PREFIX The end\n",
+	}
+
+	assert.Equal(t, strings.Join(expected, ""), buf.String())
+}
+
+// nolint:errcheck
+func TestForcedFlush(t *testing.T) {
+	buf := new(bytes.Buffer)
+
+	defer setupDummyTime()()
+
+	w := New(buf, StderrType, 255, true)
+	w.Write([]byte("PREFIX This is the beginning of a new line\n"))
+	w.Write([]byte("We have no new line character in this write"))
+	w.Write([]byte("... The line is now flushed.\n"))
+	w.Write([]byte("large continuous write incoming"))
+	w.Write(bytes.Repeat([]byte{'.'}, bufSize))
+	w.Write(bytes.Repeat([]byte{'.'}, bufSize+1))
+	w.Write([]byte("ended\n"))
+	w.Close()
+
+	expected := []string{
+		"2021-01-01T01:00:00.020010Z ffE PREFIX This is the beginning of a new line\n",
+		"2021-01-01T02:00:00.020010Z ffE We have no new line character in this write... The line is now flushed.\n",
+		"2021-01-01T03:00:00.020010Z ffE large continuous write incoming" + strings.Repeat(".", bufSize) + "\n",
+		"2021-01-01T04:00:00.020010Z ffE+" + strings.Repeat(".", bufSize+1) + "\n",
+		"2021-01-01T05:00:00.020010Z ffE+ended\n",
+	}
+
+	assert.Equal(t, strings.Join(expected, ""), buf.String())
+}
+
+// Bytes after the last \r in a single Write must stay in the same trace
+// entry, with their own fresh timestamp on each call. Splitting them off
+// strands the trailing bytes in the buffer until the next write.
+func TestCarriageReturnDoesNotSplitWrite(t *testing.T) {
+	buf := new(bytes.Buffer)
+	defer setupDummyTime()()
+
+	w := New(buf, StdoutType, 1, true)
+	_, _ = w.Write([]byte("section_start:123:foo\r\x1b[0K"))
+	_, _ = w.Write([]byte("section_end:123:foo\r\x1b[0K"))
+	_ = w.Close()
+
+	expected := strings.Join([]string{
+		"2021-01-01T01:00:00.020010Z 01O section_start:123:foo\r\x1b[0K\n",
+		"2021-01-01T02:00:00.020010Z 01O+section_end:123:foo\r\x1b[0K\n",
+	}, "")
+	assert.Equal(t, expected, buf.String())
+}
+
+func TestCloseIdempotent(t *testing.T) {
+	buf := new(bytes.Buffer)
+
+	defer setupDummyTime()()
+
+	w := New(buf, StderrType, 255, true)
+	_, err := w.Write([]byte("no trailing newline"))
+	assert.NoError(t, err)
+
+	assert.NoError(t, w.Close())
+	before := buf.String()
+
+	assert.NoError(t, w.Close())
+	assert.Equal(t, before, buf.String(), "second Close must not re-emit buffered data")
+}
+
+// TestTimestampSecondsCache covers the same-second fast path in writeHeader,
+// where Y/M/D/H/M/S are reused from the cache and only the microsecond digits
+// are refreshed. The other tests advance time by an hour per call and so
+// always hit the cache-miss branch.
+func TestTimestampSecondsCache(t *testing.T) {
+	oldNow := now
+	defer func() { now = oldNow }()
+
+	base, _ := time.Parse(time.RFC3339, "2021-06-15T12:34:56.000000Z")
+	offsets := []time.Duration{
+		0,                                // 12:34:56.000000 - first call, cache miss
+		time.Microsecond,                 // 12:34:56.000001 - same second, cache hit
+		123 * time.Microsecond,           // 12:34:56.000123 - same second, cache hit
+		time.Second,                      // 12:34:57.000000 - new second, cache miss
+		time.Second + 7*time.Microsecond, // 12:34:57.000007 - same second, cache hit
+	}
+	i := 0
+	now = func() time.Time {
+		t := base.Add(offsets[i])
+		i++
+		return t
+	}
+
+	buf := new(bytes.Buffer)
+	w := New(buf, StderrType, 1, true)
+	for range offsets {
+		_, _ = w.Write([]byte("line\n"))
+	}
+
+	expected := strings.Join([]string{
+		"2021-06-15T12:34:56.000000Z 01E line\n",
+		"2021-06-15T12:34:56.000001Z 01E line\n",
+		"2021-06-15T12:34:56.000123Z 01E line\n",
+		"2021-06-15T12:34:57.000000Z 01E line\n",
+		"2021-06-15T12:34:57.000007Z 01E line\n",
+	}, "")
+	assert.Equal(t, expected, buf.String())
+}
+
+// BenchmarkWithTimestamps mimics a realistic workload: many log lines
+// emitted within the same wall second, with microsecond-level spacing.
+func BenchmarkWithTimestamps(b *testing.B) {
+	oldNow := now
+	defer func() { now = oldNow }()
+
+	base, _ := time.Parse(time.RFC3339, "2021-01-01T00:00:00.000000Z")
+	now = func() time.Time {
+		base = base.Add(time.Microsecond)
+		return base
+	}
+
+	w := New(io.Discard, StderrType, 255, true)
+
+	headerSize := len(format) + 4
+	line := []byte("This is the beginning of a new line\n")
+	b.SetBytes(int64((headerSize + len(line)) * 200))
+
+	for b.Loop() {
+		for range 200 {
+			_, _ = w.Write(line)
+		}
+	}
+}

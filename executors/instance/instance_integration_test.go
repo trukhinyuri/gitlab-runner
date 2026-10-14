@@ -1,0 +1,289 @@
+//go:build integration
+
+package instance_test
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/cache/cacheconfig"
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildtest"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/instance"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/ssh"
+	"gitlab.com/gitlab-org/gitlab-runner/shells/shellstest"
+)
+
+const integrationTestInstanceExecutor = "instance-integration-test"
+
+var runnerPath string
+
+func TestMain(m *testing.M) {
+	code := 1
+	defer func() {
+		os.Exit(code)
+	}()
+
+	fmt.Println("Compiling gitlab-runner binary for tests")
+
+	targetDir, err := os.MkdirTemp("", "test_executor")
+	if err != nil {
+		panic("Error on preparing tmp directory for test executor binary")
+	}
+	defer os.RemoveAll(targetDir)
+
+	runnerPath = buildtest.MustBuildBinary("../..", filepath.Join(targetDir, "gitlab-runner-integration"))
+
+	code = m.Run()
+}
+
+func newRunnerConfig(t *testing.T, shell string, opts ...ssh.Option) *common.RunnerConfig {
+	helpers.SkipIntegrationTests(t, "fleeting-plugin-static", "--version")
+
+	dir := t.TempDir()
+
+	t.Log("Build directory:", dir)
+
+	srv, err := ssh.NewStubServer("root", "password", append([]ssh.Option{ssh.WithExecuteLocal()}, opts...)...)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		require.NoError(t, srv.Stop())
+	})
+
+	switch shell {
+	case "bash", "sh":
+		srv.Shell = []string{shell, "-c"}
+	case "pwsh", "powershell":
+		srv.Shell = []string{shell, "-Command"}
+	}
+
+	return &common.RunnerConfig{
+		RunnerCredentials: common.RunnerCredentials{
+			Token: "runner-token",
+		},
+		RunnerSettings: common.RunnerSettings{
+			BuildsDir: dir,
+			Executor:  integrationTestInstanceExecutor,
+			Shell:     shell,
+			Cache:     &cacheconfig.Config{},
+			Autoscaler: &common.AutoscalerConfig{
+				CapacityPerInstance: 10,
+				MaxInstances:        1,
+				Plugin:              "fleeting-plugin-static",
+				ConnectorConfig: common.ConnectorConfig{
+					Timeout: time.Minute,
+				},
+				PluginConfig: common.AutoscalerSettingsMap{
+					"instances": map[string]map[string]string{
+						"local": {
+							"username":      srv.User,
+							"password":      srv.Password,
+							"external_addr": srv.Host() + ":" + srv.Port(),
+							"internal_addr": srv.Host() + ":" + srv.Port(),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func setupAcquireBuild(t *testing.T, build *common.Build) {
+	provider := instance.NewProvider(runnerPath)
+	data, err := provider.Acquire(build.Runner)
+	require.NoError(t, err)
+
+	build.ExecutorData = data
+	build.ExecutorProvider = provider
+	t.Cleanup(func() {
+		provider.Release(build.Runner, build.ExecutorData)
+
+		if shutdownable, ok := provider.(common.ManagedExecutorProvider); ok {
+			shutdownable.Shutdown(context.Background(), nil)
+		}
+	})
+}
+
+func TestInstanceReadyCommand(t *testing.T) {
+	tests := map[string]struct {
+		command string
+		success bool
+	}{
+		"no command": {command: "", success: true},
+		"exit 0":     {command: "exit 0", success: true},
+
+		// we skip non-success codes for now, as this causes instance churn
+		// that is currently difficult to detect.
+		// "exit 1": {command: "exit 1", success: false},
+		// "exit 128":   {command: "exit 128", success: false},
+	}
+
+	for tn, tc := range tests {
+		t.Run(tn, func(t *testing.T) {
+			shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+				successfulBuild, err := common.GetRemoteSuccessfulBuild()
+				require.NoError(t, err)
+
+				cfg := newRunnerConfig(t, shell)
+				cfg.Autoscaler.InstanceReadyCommand = tc.command
+
+				build := &common.Build{
+					Job:    successfulBuild,
+					Runner: cfg,
+				}
+				// GetRemoteSuccessfulBuild clones from a real remote over
+				// the network, which the default GET_SOURCES_ATTEMPTS=1
+				// gives no retry budget for. 3 matches
+				// defaultPullMaxAttempts in the image-pull retry manager,
+				// the existing convention elsewhere in this codebase for a
+				// transient external-dependency failure.
+				build.Variables = append(build.Variables, spec.Variable{
+					Key:   "GET_SOURCES_ATTEMPTS",
+					Value: "3",
+				})
+				setupAcquireBuild(t, build)
+
+				err = buildtest.RunBuild(t, build)
+				if tc.success {
+					require.NoError(t, err)
+				} else {
+					require.Error(t, err)
+				}
+			})
+		})
+	}
+}
+
+func TestBuildSuccess(t *testing.T) {
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		successfulBuild, err := common.GetRemoteSuccessfulBuild()
+		require.NoError(t, err)
+
+		build := &common.Build{
+			Job:    successfulBuild,
+			Runner: newRunnerConfig(t, shell),
+		}
+		setupAcquireBuild(t, build)
+
+		require.NoError(t, buildtest.RunBuild(t, build))
+	})
+}
+
+func TestConnectionFailed(t *testing.T) {
+	shell := "bash"
+	if runtime.GOOS == "windows" {
+		shell = "pwsh"
+	}
+
+	successfulBuild, err := common.GetRemoteSuccessfulBuild()
+	require.NoError(t, err)
+
+	build := &common.Build{
+		Job:    successfulBuild,
+		Runner: newRunnerConfig(t, shell, ssh.WithDontAcceptConnections()),
+	}
+	build.Runner.Autoscaler.ConnectorConfig.Timeout = 5 * time.Second
+	setupAcquireBuild(t, build)
+
+	require.ErrorContains(t, buildtest.RunBuild(t, build), "creating instance environment: dial ssh:")
+	require.ErrorContains(t, buildtest.RunBuild(t, build), "ssh: handshake failed: read tcp")
+}
+
+func TestBuildCancel(t *testing.T) {
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		buildtest.RunBuildWithCancel(t, newRunnerConfig(t, shell), setupAcquireBuild)
+	})
+}
+
+func TestBuildMasking(t *testing.T) {
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		buildtest.RunBuildWithMasking(t, newRunnerConfig(t, shell), setupAcquireBuild)
+	})
+}
+
+func TestBuildWithStdinClosed(t *testing.T) {
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		buildtest.RunBuildWithStdinClosed(t, newRunnerConfig(t, shell), setupAcquireBuild)
+	})
+}
+
+func TestBuildExpandedFileVariable(t *testing.T) {
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		buildtest.RunBuildWithExpandedFileVariable(t, newRunnerConfig(t, shell), setupAcquireBuild)
+	})
+}
+
+func TestStepsIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("native steps are not supported on windows")
+	}
+
+	tests := map[string]struct {
+		steps     string
+		variables spec.Variables
+		wantOut   []string
+		wantErr   bool
+	}{
+		"script": {
+			steps: `- name: echo
+  script: echo foo bar baz
+- name: env
+  script: env`,
+			wantOut: []string{"foo bar baz"},
+		},
+		"file variable": {
+			steps: `- name: cat
+  script: cat ${{ job.A_FILE_VAR }}`,
+			variables: spec.Variables{{Key: "A_FILE_VAR", Value: "oh this is soo secret", File: true}},
+			wantOut:   []string{"oh this is soo secret"},
+		},
+		"job variables should not appear in environment": {
+			steps: `- name: echo
+  script: echo ${{ env.FLIN_FLAN_FLON }}`,
+			variables: spec.Variables{{Key: "FLIN_FLAN_FLON", Value: "flin, flan, flon"}},
+			wantOut: []string{
+				"ERROR: Job failed:",
+				`evaluating expression failed at ".FLIN_FLAN_FLON": attribute not found`,
+			},
+			wantErr: true,
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			job, err := common.GetRemoteStepsBuildResponse(tt.steps)
+			require.NoError(t, err)
+
+			job.Variables = append(job.Variables, tt.variables...)
+
+			build := &common.Build{
+				Job:    job,
+				Runner: newRunnerConfig(t, "bash"),
+			}
+			setupAcquireBuild(t, build)
+
+			out, err := buildtest.RunBuildReturningOutput(t, build)
+			wantOut := tt.wantOut
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				wantOut = append(wantOut, "Job succeeded")
+			}
+
+			for _, want := range wantOut {
+				assert.Contains(t, out, want)
+			}
+		})
+	}
+}

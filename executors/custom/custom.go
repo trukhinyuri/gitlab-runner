@@ -1,0 +1,429 @@
+package custom
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+
+	"github.com/sirupsen/logrus"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildlogger"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/custom/api"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/custom/command"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/featureflags"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/process"
+)
+
+type commandOutputs struct {
+	stdout io.WriteCloser
+	stderr io.WriteCloser
+}
+
+func (c *commandOutputs) Close() error {
+	return errors.Join(c.stdout.Close(), c.stderr.Close())
+}
+
+type prepareCommandOpts struct {
+	executable string
+	args       []string
+	out        commandOutputs
+}
+
+type ConfigExecOutput struct {
+	api.ConfigExecOutput
+}
+
+type jsonService struct {
+	Name       string            `json:"name"`
+	Alias      string            `json:"alias"`
+	Entrypoint []string          `json:"entrypoint"`
+	Command    []string          `json:"command"`
+	Variables  map[string]string `json:"variables,omitempty"`
+}
+
+func (c *ConfigExecOutput) InjectInto(executor *executor) {
+	if c.Hostname != nil {
+		executor.Build.Hostname = *c.Hostname
+	}
+
+	if c.BuildsDir != nil {
+		executor.Config.BuildsDir = *c.BuildsDir
+	}
+
+	if c.CacheDir != nil {
+		executor.Config.CacheDir = *c.CacheDir
+	}
+
+	if c.BuildsDirIsShared != nil {
+		executor.SharedBuildsDir = *c.BuildsDirIsShared
+	}
+
+	executor.driverInfo = c.Driver
+
+	if c.JobEnv != nil {
+		executor.jobEnv = *c.JobEnv
+	}
+
+	if c.Shell != nil {
+		executor.Config.Shell = *c.Shell
+	}
+}
+
+type executor struct {
+	executors.AbstractExecutor
+
+	config            *config
+	tempDir           string
+	jobResponseFile   string
+	buildExitCodeFile string
+
+	driverInfo *api.DriverInfo
+
+	jobEnv map[string]string
+}
+
+func (e *executor) Prepare(options common.ExecutorPrepareOptions) error {
+	e.AbstractExecutor.PrepareConfiguration(options)
+
+	err := e.prepareConfig()
+	if err != nil {
+		return err
+	}
+
+	e.tempDir, err = os.MkdirTemp("", "custom-executor")
+	if err != nil {
+		return err
+	}
+
+	e.jobResponseFile, err = e.createJobResponseFile()
+	if err != nil {
+		return err
+	}
+
+	e.buildExitCodeFile = filepath.Join(e.tempDir, "build_exit_code")
+
+	err = e.dynamicConfig()
+	if err != nil {
+		return err
+	}
+
+	e.logStartupMessage()
+
+	err = e.AbstractExecutor.PrepareBuildAndShell()
+	if err != nil {
+		return err
+	}
+
+	// nothing to do, as there's no prepare_script
+	if e.config.PrepareExec == "" {
+		return nil
+	}
+
+	ctx, cancelFunc := context.WithTimeout(e.Context, e.config.GetPrepareExecTimeout())
+	defer cancelFunc()
+
+	opts := prepareCommandOpts{
+		executable: e.config.PrepareExec,
+		args:       e.config.PrepareArgs,
+		out: commandOutputs{
+			stdout: e.BuildLogger.Stream(buildlogger.StreamExecutorLevel, buildlogger.Stdout),
+			stderr: e.BuildLogger.Stream(buildlogger.StreamExecutorLevel, buildlogger.Stderr),
+		},
+	}
+	defer opts.out.Close()
+
+	return e.prepareCommand(ctx, opts).Run()
+}
+
+func (e *executor) prepareConfig() error {
+	if e.Config.Custom == nil {
+		return &common.BuildError{Inner: fmt.Errorf("custom executor not configured"), FailureReason: common.ConfigurationError}
+	}
+
+	e.config = &config{
+		CustomConfig: e.Config.Custom,
+	}
+
+	if e.config.RunExec == "" {
+		return &common.BuildError{Inner: fmt.Errorf("custom executor is missing RunExec"), FailureReason: common.ConfigurationError}
+	}
+
+	return nil
+}
+
+func (e *executor) createJobResponseFile() (string, error) {
+	responseFile := filepath.Join(e.tempDir, "response.json")
+	file, err := os.OpenFile(responseFile, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("creating job response file %q: %w", responseFile, err)
+	}
+	defer func() { _ = file.Close() }()
+
+	encoder := json.NewEncoder(file)
+	err = encoder.Encode(e.Build.Job)
+	if err != nil {
+		return "", fmt.Errorf("encoding job response file: %w", err)
+	}
+
+	return responseFile, nil
+}
+
+func (e *executor) dynamicConfig() error {
+	if e.config.ConfigExec == "" {
+		return nil
+	}
+
+	ctx, cancelFunc := context.WithTimeout(e.Context, e.config.GetConfigExecTimeout())
+	defer cancelFunc()
+
+	buf := bytes.NewBuffer(nil)
+
+	opts := prepareCommandOpts{
+		executable: e.config.ConfigExec,
+		args:       e.config.ConfigArgs,
+		out: commandOutputs{
+			stdout: buildlogger.NewNopCloser(buf),
+			stderr: e.BuildLogger.Stream(buildlogger.StreamExecutorLevel, buildlogger.Stderr),
+		},
+	}
+	defer opts.out.Close()
+
+	// Force refresh of all build variables for the upcoming command, ensuring
+	// that the up-to-date environment variables are provided to the ConfigExec script.
+	e.Build.RefreshAllVariables()
+
+	err := e.prepareCommand(ctx, opts).Run()
+	if err != nil {
+		return err
+	}
+
+	jsonConfig := buf.Bytes()
+	if len(jsonConfig) < 1 {
+		return nil
+	}
+
+	config := new(ConfigExecOutput)
+
+	err = json.Unmarshal(jsonConfig, config)
+	if err != nil {
+		return fmt.Errorf("error while parsing JSON output: %w", err)
+	}
+
+	config.InjectInto(e)
+
+	return nil
+}
+
+func (e *executor) logStartupMessage() {
+	const usageLine = "Using Custom executor"
+
+	info := e.driverInfo
+	if info == nil || info.Name == nil {
+		e.BuildLogger.Println(fmt.Sprintf("%s...", usageLine))
+		return
+	}
+
+	if info.Version == nil {
+		e.BuildLogger.Println(fmt.Sprintf("%s with driver %s...", usageLine, *info.Name))
+		return
+	}
+
+	e.BuildLogger.Println(fmt.Sprintf("%s with driver %s %s...", usageLine, *info.Name, *info.Version))
+}
+
+var commandFactory = command.New
+
+func (e *executor) prepareCommand(ctx context.Context, opts prepareCommandOpts) command.Command {
+	logger := common.NewProcessLoggerAdapter(e.BuildLogger)
+
+	cmdOpts := process.CommandOptions{
+		Dir:                             e.tempDir,
+		Env:                             make([]string, 0),
+		Stdout:                          opts.out.stdout,
+		Stderr:                          opts.out.stderr,
+		Logger:                          logger,
+		GracefulKillTimeout:             e.config.GetGracefulKillTimeout(),
+		ForceKillTimeout:                e.config.GetForceKillTimeout(),
+		UseWindowsLegacyProcessStrategy: e.Build.IsFeatureFlagOn(featureflags.UseWindowsLegacyProcessStrategy),
+		UseWindowsJobObject:             e.Build.IsFeatureFlagOn(featureflags.UseWindowsJobObject),
+	}
+
+	// Append job_env defined variable first to avoid overwriting any CI/CD or predefined variables.
+	for k, v := range e.jobEnv {
+		cmdOpts.Env = append(cmdOpts.Env, fmt.Sprintf("%s=%s", k, v))
+	}
+
+	variables := append(e.Build.GetAllVariables(), e.getCIJobServicesEnv())
+	for _, variable := range variables {
+		cmdOpts.Env = append(cmdOpts.Env, fmt.Sprintf("CUSTOM_ENV_%s=%s", variable.Key, variable.Value))
+	}
+
+	options := command.Options{
+		JobResponseFile:   e.jobResponseFile,
+		BuildExitCodeFile: e.buildExitCodeFile,
+	}
+
+	return commandFactory(ctx, opts.executable, opts.args, cmdOpts, options)
+}
+
+func (e *executor) getCIJobServicesEnv() spec.Variable {
+	if len(e.Build.Services) == 0 {
+		return spec.Variable{Key: "CI_JOB_SERVICES"}
+	}
+
+	buildVars := e.Build.GetAllVariables()
+
+	var services []jsonService
+	for _, service := range e.Build.Services {
+		var variables map[string]string
+		if len(service.Variables) > 0 {
+			allVars := make(spec.Variables, 0, len(buildVars)+len(service.Variables))
+			allVars = append(allVars, buildVars...)
+			allVars = append(allVars, service.Variables...)
+			expanded := allVars.Expand()
+
+			variables = make(map[string]string, len(service.Variables))
+			for _, v := range service.Variables {
+				variables[v.Key] = expanded.Value(v.Key)
+			}
+		}
+		services = append(services, jsonService{
+			Name:       service.Name,
+			Alias:      append(service.Aliases(), "")[0],
+			Entrypoint: service.Entrypoint,
+			Command:    service.Command,
+			Variables:  variables,
+		})
+	}
+
+	servicesSerialized, err := json.Marshal(services)
+	if err != nil {
+		e.BuildLogger.Warningln("Unable to serialize CI_JOB_SERVICES json:", err)
+	}
+
+	return spec.Variable{
+		Key:   "CI_JOB_SERVICES",
+		Value: string(servicesSerialized),
+	}
+}
+
+func (e *executor) Run(cmd common.ExecutorCommand) error {
+	scriptDir, err := os.MkdirTemp(e.tempDir, "script")
+	if err != nil {
+		return err
+	}
+
+	scriptName := "script"
+	if e.BuildShell.Extension != "" {
+		scriptName += "." + e.BuildShell.Extension
+	}
+
+	scriptFile := filepath.Join(scriptDir, scriptName)
+	err = os.WriteFile(scriptFile, []byte(cmd.Script), 0o700)
+	if err != nil {
+		return err
+	}
+
+	// TODO: Remove this translation - https://gitlab.com/groups/gitlab-org/-/epics/6112
+	stage := cmd.Stage
+	if stage == "step_script" {
+		e.BuildLogger.Warningln("Starting with version 17.0 the 'build_script' stage " +
+			"will be replaced with 'step_script': https://gitlab.com/groups/gitlab-org/-/epics/6112")
+		stage = "build_script"
+	}
+
+	args := append(e.config.RunArgs, scriptFile, string(stage)) //nolint:gocritic
+
+	opts := prepareCommandOpts{
+		executable: e.config.RunExec,
+		args:       args,
+		out: commandOutputs{
+			stdout: e.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stdout),
+			stderr: e.BuildLogger.Stream(buildlogger.StreamWorkLevel, buildlogger.Stderr),
+		},
+	}
+	defer opts.out.Close()
+
+	return e.prepareCommand(cmd.Context, opts).Run()
+}
+
+func (e *executor) Cleanup() {
+	e.AbstractExecutor.Cleanup()
+
+	err := e.prepareConfig()
+	if err != nil {
+		e.BuildLogger.Warningln(err)
+
+		// at this moment we don't care about the errors
+		return
+	}
+
+	defer func() { _ = os.RemoveAll(e.tempDir) }()
+
+	// nothing to do, as there's no cleanup_script
+	if e.config.CleanupExec == "" {
+		return
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), e.config.GetCleanupScriptTimeout())
+	defer cancelFunc()
+
+	stdoutLogger := e.BuildLogger.WithFields(logrus.Fields{"cleanup_std": "out"})
+	stderrLogger := e.BuildLogger.WithFields(logrus.Fields{"cleanup_std": "err"})
+
+	opts := prepareCommandOpts{
+		executable: e.config.CleanupExec,
+		args:       e.config.CleanupArgs,
+		out: commandOutputs{
+			stdout: stdoutLogger.WriterLevel(logrus.DebugLevel),
+			stderr: stderrLogger.WriterLevel(logrus.WarnLevel),
+		},
+	}
+	defer opts.out.Close()
+
+	err = e.prepareCommand(ctx, opts).Run()
+	if err != nil {
+		e.BuildLogger.Warningln("Cleanup script failed:", err)
+	}
+}
+
+func NewProvider(runnerCommandPath string) common.ExecutorProvider {
+	options := executors.ExecutorOptions{
+		DefaultCustomBuildsDirEnabled: false,
+		DefaultSafeDirectoryCheckout:  false,
+		Shell: common.ShellScriptInfo{
+			Shell:         common.GetDefaultShell(),
+			Type:          common.NormalShell,
+			RunnerCommand: runnerCommandPath,
+		},
+		ShowHostname: false,
+	}
+
+	creator := func() common.Executor {
+		return &executor{
+			AbstractExecutor: executors.AbstractExecutor{
+				ExecutorOptions: options,
+			},
+		}
+	}
+
+	featuresUpdater := func(features *common.FeaturesInfo) {
+		features.Variables = true
+		features.Shared = true
+		features.ServiceVariables = true
+	}
+
+	return executors.DefaultExecutorProvider{
+		Creator:          creator,
+		FeaturesUpdater:  featuresUpdater,
+		DefaultShellName: options.Shell.Shell,
+	}
+}

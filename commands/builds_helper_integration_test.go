@@ -1,0 +1,81 @@
+//go:build integration
+
+package commands
+
+import (
+	"io"
+	"runtime"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/commands/internal/configfile"
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/buildtest"
+	shell_executor "gitlab.com/gitlab-org/gitlab-runner/executors/shell"
+)
+
+func TestBuildsHelperCollect(t *testing.T) {
+	dir := t.TempDir()
+
+	ch := make(chan prometheus.Metric, 50)
+	b := newBuildsHelper()
+
+	longRunningBuild, err := common.GetLongRunningBuild()
+	require.NoError(t, err)
+
+	shell := "bash"
+	if runtime.GOOS == "windows" {
+		shell = "powershell"
+	}
+
+	systemID, err := configfile.GenerateUniqueSystemID()
+	require.NoError(t, err)
+
+	build := &common.Build{
+		Job: longRunningBuild,
+		Runner: &common.RunnerConfig{
+			RunnerSettings: common.RunnerSettings{
+				BuildsDir: dir,
+				Executor:  "shell",
+				Shell:     shell,
+			},
+			SystemID: systemID,
+		},
+		ExecutorProvider: shell_executor.NewProvider("gitlab-runner"),
+	}
+	trace := &common.Trace{Writer: io.Discard}
+
+	done := make(chan error)
+	go func() {
+		done <- buildtest.RunBuildWithTrace(t, build, trace)
+	}()
+
+	b.builds = append(b.builds, build)
+	// collect many logs whilst the build is being executed to trigger any
+	// potential race conditions that arise from the build progressing whilst
+	// metrics are collected.
+	for i := 0; i < 200; i++ {
+		if i == 100 {
+			// Build might have not started yet, wait until cancel is
+			// successful.
+			require.Eventually(
+				t,
+				func() bool {
+					return trace.Abort()
+				},
+				time.Minute,
+				10*time.Millisecond,
+			)
+		}
+		b.Collect(ch)
+		<-ch
+	}
+
+	err = <-done
+	expected := &common.BuildError{FailureReason: common.JobCanceled}
+	assert.ErrorIs(t, err, expected)
+}

@@ -1,0 +1,288 @@
+//go:build !integration
+
+package exec
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"sync"
+	"testing"
+
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/client"
+	"github.com/sirupsen/logrus"
+	"github.com/sirupsen/logrus/hooks/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/wait"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+)
+
+func TestDefaultDocker_Exec(t *testing.T) {
+	id := "container-id"
+
+	input := func(t *testing.T, err error) io.Reader {
+		r := newMockReader(t)
+		r.On("Read", mock.Anything).
+			Return(0, err).
+			Maybe()
+
+		return r
+	}
+
+	mockWorkingClient := func(
+		t *testing.T,
+		clientMock *docker.MockClient,
+		reader io.Reader,
+		expectedCtx context.Context,
+	) {
+		conn := newMockConn(t)
+		conn.On("Close").Return(nil).Maybe()
+		conn.On("Write", mock.Anything).Return(0, nil).Maybe()
+
+		hijacked := client.HijackedResponse{
+			Conn:   conn,
+			Reader: bufio.NewReader(reader),
+		}
+
+		clientMock.On("ContainerAttach", expectedCtx, id, attachOptions()).
+			Return(hijacked, nil).
+			Once()
+		clientMock.On("ContainerStart", expectedCtx, id, client.ContainerStartOptions{}).
+			Return(nil).
+			Once()
+	}
+
+	tests := map[string]struct {
+		input             io.Reader
+		cancelContext     bool
+		setupDockerClient func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context)
+		setupKillWaiter   func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context)
+		assertLogOutput   func(t *testing.T, logOutput string)
+		expectedError     error
+		expectedStdOut    string
+		expectedStdErr    string
+	}{
+		"ContainerAttach error": {
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				clientMock.On("ContainerAttach", expectedCtx, id, attachOptions()).
+					Return(client.HijackedResponse{}, assert.AnError).
+					Once()
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {},
+			assertLogOutput: func(t *testing.T, logOutput string) {},
+			expectedError:   assert.AnError,
+		},
+		"ContainerStart error": {
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				conn := newMockConn(t)
+				conn.On("Close").Return(nil).Once()
+
+				hijacked := client.HijackedResponse{
+					Conn: conn,
+				}
+
+				clientMock.On("ContainerAttach", expectedCtx, id, attachOptions()).
+					Return(hijacked, nil).
+					Once()
+				clientMock.On("ContainerStart", expectedCtx, id, client.ContainerStartOptions{}).
+					Return(assert.AnError).
+					Once()
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {},
+			assertLogOutput: func(t *testing.T, logOutput string) {},
+			expectedError:   assert.AnError,
+		},
+		"context done": {
+			input:         input(t, io.EOF),
+			cancelContext: true,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				reader := newMockReader(t)
+				reader.On("Read", mock.Anything).
+					Return(0, nil).Maybe()
+
+				mockWorkingClient(t, clientMock, reader, expectedCtx)
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {
+				waiterMock.On("StopKillWait", expectedCtx, id, mock.Anything, mock.AnythingOfType("wait.GracefulExitFunc")).Return(nil).Once()
+			},
+			assertLogOutput: func(t *testing.T, logOutput string) {
+				assert.Contains(t, logOutput, "finished with aborted")
+			},
+			expectedError: nil,
+		},
+		"input error": {
+			input:         input(t, errors.New("input error")),
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				reader := newMockReader(t)
+				reader.On("Read", mock.Anything).
+					Return(0, nil).Maybe()
+
+				mockWorkingClient(t, clientMock, reader, expectedCtx)
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {
+				waiterMock.On("StopKillWait", expectedCtx, id, mock.Anything, mock.AnythingOfType("wait.GracefulExitFunc")).Return(nil).Once()
+			},
+			assertLogOutput: func(t *testing.T, logOutput string) {
+				assert.Contains(t, logOutput, "finished with input error")
+			},
+			expectedError: nil,
+		},
+		"output error": {
+			input:         input(t, io.EOF),
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				reader := newMockReader(t)
+				reader.On("Read", mock.Anything).
+					Return(0, errors.New("output error"))
+
+				mockWorkingClient(t, clientMock, reader, expectedCtx)
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {
+				waiterMock.On("StopKillWait", expectedCtx, id, mock.Anything, mock.AnythingOfType("wait.GracefulExitFunc")).Return(nil).Once()
+			},
+			assertLogOutput: func(t *testing.T, logOutput string) {
+				assert.Contains(t, logOutput, "finished with output error")
+			},
+			expectedError: nil,
+		},
+		"killWaiter error": {
+			input:         input(t, io.EOF),
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				reader := newMockReader(t)
+				reader.On("Read", mock.Anything).
+					Return(0, io.EOF).
+					Once()
+
+				mockWorkingClient(t, clientMock, reader, expectedCtx)
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {
+				waiterMock.On("StopKillWait", expectedCtx, id, mock.Anything, mock.AnythingOfType("wait.GracefulExitFunc")).Return(assert.AnError).Once()
+			},
+			assertLogOutput: func(t *testing.T, logOutput string) {},
+			expectedError:   assert.AnError,
+		},
+		"output passed to the writers": {
+			input:         input(t, io.EOF),
+			cancelContext: false,
+			setupDockerClient: func(t *testing.T, clientMock *docker.MockClient, expectedCtx context.Context) {
+				pr, pw := io.Pipe()
+
+				outWriter := newStdWriter(pw, stdcopy.Stdout)
+				errWriter := newStdWriter(pw, stdcopy.Stderr)
+
+				var wg sync.WaitGroup
+				t.Cleanup(wg.Wait)
+				wg.Go(func() {
+					var err error
+					_, err = fmt.Fprintln(outWriter, "out line 1")
+					require.NoError(t, err)
+					_, err = fmt.Fprintln(errWriter, "err line 1")
+					require.NoError(t, err)
+					_, err = fmt.Fprintln(outWriter, "out line 2")
+					require.NoError(t, err)
+					_, err = fmt.Fprintln(errWriter, "err line 2")
+					require.NoError(t, err)
+					err = pw.Close()
+					require.NoError(t, err)
+				})
+
+				mockWorkingClient(t, clientMock, pr, expectedCtx)
+			},
+			setupKillWaiter: func(t *testing.T, waiterMock *wait.MockKillWaiter, expectedCtx context.Context) {
+				waiterMock.On("StopKillWait", expectedCtx, id, mock.Anything, mock.AnythingOfType("wait.GracefulExitFunc")).Return(nil).Once()
+			},
+			assertLogOutput: func(t *testing.T, logOutput string) {},
+			expectedError:   nil,
+			expectedStdOut:  "out line 1\nout line 2\n",
+			expectedStdErr:  "err line 1\nerr line 2\n",
+		},
+	}
+
+	for tn, tt := range tests {
+		t.Run(tn, func(t *testing.T) {
+			clientMock := docker.NewMockClient(t)
+			waiterMock := wait.NewMockKillWaiter(t)
+
+			logger, hook := test.NewNullLogger()
+			logger.SetLevel(logrus.DebugLevel)
+
+			executorCtx, executorCancelFn := context.WithCancel(t.Context())
+			defer executorCancelFn()
+
+			ctx, cancelFn := context.WithCancel(executorCtx)
+			defer cancelFn()
+
+			outBuf := new(bytes.Buffer)
+			errBuf := new(bytes.Buffer)
+
+			tt.setupDockerClient(t, clientMock, ctx)
+			tt.setupKillWaiter(t, waiterMock, executorCtx)
+
+			if tt.cancelContext {
+				cancelFn()
+			}
+
+			streams := IOStreams{
+				Stdin:  tt.input,
+				Stdout: outBuf,
+				Stderr: errBuf,
+			}
+
+			dockerExec := NewDocker(executorCtx, clientMock, waiterMock, logger)
+			err := dockerExec.Exec(ctx, id, streams, nil)
+
+			var logOutput strings.Builder
+			for _, entry := range hook.AllEntries() {
+				line, e := entry.String()
+				require.NoError(t, e)
+				logOutput.WriteString(line)
+			}
+
+			tt.assertLogOutput(t, logOutput.String())
+
+			if tt.expectedError != nil {
+				assert.ErrorIs(t, err, tt.expectedError)
+				return
+			}
+
+			assert.NoError(t, err)
+
+			assert.Equal(t, tt.expectedStdOut, outBuf.String())
+			assert.Equal(t, tt.expectedStdErr, errBuf.String())
+		})
+	}
+}
+
+// newStdWriter returns an io.Writer that frames writes using the docker
+// stdcopy multiplexing format.
+func newStdWriter(w io.Writer, t stdcopy.StdType) io.Writer {
+	return &stdWriter{Writer: w, prefix: byte(t)}
+}
+
+type stdWriter struct {
+	io.Writer
+	prefix byte
+}
+
+func (w *stdWriter) Write(p []byte) (int, error) {
+	var header [8]byte
+	header[0] = w.prefix
+	binary.BigEndian.PutUint32(header[4:], uint32(len(p)))
+	if _, err := w.Writer.Write(header[:]); err != nil {
+		return 0, err
+	}
+	return w.Writer.Write(p)
+}

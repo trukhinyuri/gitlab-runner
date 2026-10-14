@@ -1,0 +1,287 @@
+//go:build !integration
+
+package commands
+
+import (
+	"errors"
+	"flag"
+	"fmt"
+	"testing"
+
+	"dario.cat/mergo"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/urfave/cli"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+)
+
+func setupDockerRegisterCommand(dockerConfig *common.DockerConfig) *RegisterCommand {
+	fs := flag.NewFlagSet("", flag.ExitOnError)
+	ctx := cli.NewContext(cli.NewApp(), fs, nil)
+	fs.String("docker-image", "ruby:3.3", "")
+
+	s := &RegisterCommand{
+		context:        ctx,
+		NonInteractive: true,
+	}
+	s.Docker = dockerConfig
+
+	return s
+}
+
+func TestRegisterDefaultDockerCacheVolume(t *testing.T) {
+	s := setupDockerRegisterCommand(&common.DockerConfig{
+		Volumes: []string{},
+	})
+
+	s.askDocker()
+
+	assert.Equal(t, 1, len(s.Docker.Volumes))
+	assert.Equal(t, "/cache", s.Docker.Volumes[0])
+}
+
+func TestDoNotRegisterDefaultDockerCacheVolumeWhenDisableCache(t *testing.T) {
+	s := setupDockerRegisterCommand(&common.DockerConfig{
+		Volumes:      []string{},
+		DisableCache: true,
+	})
+
+	s.askDocker()
+
+	assert.Len(t, s.Docker.Volumes, 0)
+}
+
+func TestRegisterCustomDockerCacheVolume(t *testing.T) {
+	s := setupDockerRegisterCommand(&common.DockerConfig{
+		Volumes: []string{"/cache"},
+	})
+
+	s.askDocker()
+
+	assert.Equal(t, 1, len(s.Docker.Volumes))
+	assert.Equal(t, "/cache", s.Docker.Volumes[0])
+}
+
+func TestRegisterCustomMappedDockerCacheVolume(t *testing.T) {
+	s := setupDockerRegisterCommand(&common.DockerConfig{
+		Volumes: []string{"/my/cache:/cache"},
+	})
+
+	s.askDocker()
+
+	assert.Equal(t, 1, len(s.Docker.Volumes))
+	assert.Equal(t, "/my/cache:/cache", s.Docker.Volumes[0])
+}
+
+func TestConfigTemplate_Enabled(t *testing.T) {
+	tests := map[string]struct {
+		path          string
+		expectedValue bool
+	}{
+		"configuration file defined": {
+			path:          "/path/to/file",
+			expectedValue: true,
+		},
+		"configuration file not defined": {
+			path:          "",
+			expectedValue: false,
+		},
+	}
+
+	for tn, tc := range tests {
+		t.Run(tn, func(t *testing.T) {
+			configTemplate := &configTemplate{ConfigFile: tc.path}
+			assert.Equal(t, tc.expectedValue, configTemplate.Enabled())
+		})
+	}
+}
+
+var (
+	configTemplateMergeToInvalidConfiguration = `- , ;`
+
+	configTemplateMergeToEmptyConfiguration = ``
+
+	configTemplateMergeToTwoRunnerSectionsConfiguration = `
+[[runners]]
+[[runners]]`
+
+	configTemplateMergeToOverwritingConfiguration = `
+[[runners]]
+  token = "different_token"
+  executor = "docker"
+  limit = 100`
+
+	configTemplateMergeToAdditionalConfiguration = `
+[[runners]]
+  [runners.kubernetes]
+    [runners.kubernetes.volumes]
+      [[runners.kubernetes.volumes.empty_dir]]
+        name = "empty_dir"
+	    mount_path = "/path/to/empty_dir"
+	    medium = "Memory"
+	    size_limit = "1G"`
+
+	configTemplateMergeToBaseConfiguration = &common.RunnerConfig{
+		RunnerCredentials: common.RunnerCredentials{
+			Token: "test-runner-token",
+		},
+		RunnerSettings: common.RunnerSettings{
+			Executor: "shell",
+		},
+	}
+)
+
+func TestConfigTemplate_MergeTo(t *testing.T) {
+	tests := map[string]struct {
+		templateContent string
+		config          *common.RunnerConfig
+
+		expectedError       error
+		assertConfiguration func(t *testing.T, config *common.RunnerConfig)
+	}{
+		"invalid template file": {
+			templateContent: configTemplateMergeToInvalidConfiguration,
+			config:          configTemplateMergeToBaseConfiguration,
+			expectedError:   errors.New("couldn't load configuration template file: decoding configuration file: toml: line 1: expected '.' or '=', but got ',' instead"),
+		},
+		"no runners in template": {
+			templateContent: configTemplateMergeToEmptyConfiguration,
+			config:          configTemplateMergeToBaseConfiguration,
+			expectedError:   errors.New("configuration template must contain exactly one [[runners]] entry"),
+		},
+		"multiple runners in template": {
+			templateContent: configTemplateMergeToTwoRunnerSectionsConfiguration,
+			config:          configTemplateMergeToBaseConfiguration,
+			expectedError:   errors.New("configuration template must contain exactly one [[runners]] entry"),
+		},
+		"template doesn't overwrite existing settings": {
+			templateContent: configTemplateMergeToOverwritingConfiguration,
+			config:          configTemplateMergeToBaseConfiguration,
+			assertConfiguration: func(t *testing.T, config *common.RunnerConfig) {
+				assert.Equal(t, configTemplateMergeToBaseConfiguration.Token, config.RunnerCredentials.Token)
+				assert.Equal(t, configTemplateMergeToBaseConfiguration.Executor, config.RunnerSettings.Executor)
+				assert.Equal(t, 100, config.Limit)
+			},
+			expectedError: nil,
+		},
+		"template doesn't overwrite token if none provided in base": {
+			templateContent: configTemplateMergeToOverwritingConfiguration,
+			config:          &common.RunnerConfig{},
+			assertConfiguration: func(t *testing.T, config *common.RunnerConfig) {
+				assert.Equal(t, "", config.Token)
+			},
+		},
+		"template adds additional content": {
+			templateContent: configTemplateMergeToAdditionalConfiguration,
+			config:          configTemplateMergeToBaseConfiguration,
+			assertConfiguration: func(t *testing.T, config *common.RunnerConfig) {
+				k8s := config.RunnerSettings.Kubernetes
+
+				require.NotNil(t, k8s)
+				require.NotEmpty(t, k8s.Volumes.EmptyDirs)
+				assert.Len(t, k8s.Volumes.EmptyDirs, 1)
+
+				emptyDir := k8s.Volumes.EmptyDirs[0]
+				assert.Equal(t, "empty_dir", emptyDir.Name)
+				assert.Equal(t, "/path/to/empty_dir", emptyDir.MountPath)
+				assert.Equal(t, "Memory", emptyDir.Medium)
+				assert.Equal(t, "1G", emptyDir.SizeLimit)
+			},
+			expectedError: nil,
+		},
+		"error on merging": {
+			templateContent: configTemplateMergeToAdditionalConfiguration,
+			expectedError: fmt.Errorf(
+				"error while merging configuration with configuration template: %w",
+				mergo.ErrNotSupported,
+			),
+		},
+	}
+
+	for tn, tc := range tests {
+		t.Run(tn, func(t *testing.T) {
+			file, cleanup := PrepareConfigurationTemplateFile(t, tc.templateContent)
+			defer cleanup()
+
+			configTemplate := &configTemplate{ConfigFile: file}
+			err := configTemplate.MergeTo(tc.config)
+
+			if tc.expectedError != nil {
+				assert.ErrorContains(t, err, tc.expectedError.Error())
+
+				return
+			}
+
+			assert.NoError(t, err)
+			tc.assertConfiguration(t, tc.config)
+		})
+	}
+}
+
+func TestSetFipsHelperImageFlavor(t *testing.T) {
+	tests := map[string]struct {
+		fipsEnabled          bool
+		dockerConfig         *common.DockerConfig
+		k8sConfig            *common.KubernetesConfig
+		expectedDockerFlavor string
+		expectedK8sFlavor    string
+	}{
+		"Docker, fips disabled, no flavor, no changes": {
+			dockerConfig: &common.DockerConfig{},
+		},
+		"Docker, fips disabled, existing flavor, no changes": {
+			dockerConfig:         &common.DockerConfig{HelperImageFlavor: "blammo"},
+			expectedDockerFlavor: "blammo",
+		},
+		"Docker, fips enabled, no flavor, update config": {
+			fipsEnabled:          true,
+			dockerConfig:         &common.DockerConfig{},
+			expectedDockerFlavor: "ubi-fips",
+		},
+		"Docker, fips enabled, existing flavor, no changes": {
+			fipsEnabled:          true,
+			dockerConfig:         &common.DockerConfig{HelperImageFlavor: "blammo"},
+			expectedDockerFlavor: "blammo",
+		},
+
+		"Kubernetes, fips disabled, no flavor, no changes": {
+			k8sConfig: &common.KubernetesConfig{},
+		},
+		"Kubernetes, fips disabled, existing flavor, no changes": {
+			k8sConfig:         &common.KubernetesConfig{HelperImageFlavor: "blammo"},
+			expectedK8sFlavor: "blammo",
+		},
+		"Kubernetes, fips enabled, no flavor, update config": {
+			fipsEnabled:       true,
+			k8sConfig:         &common.KubernetesConfig{},
+			expectedK8sFlavor: "ubi-fips",
+		},
+		"Kubernetes, fips enabled, existing flavor, no changes": {
+			fipsEnabled:       true,
+			k8sConfig:         &common.KubernetesConfig{HelperImageFlavor: "blammo"},
+			expectedK8sFlavor: "blammo",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			// Create a test runner config
+			cfg := &common.RunnerConfig{
+				RunnerSettings: common.RunnerSettings{
+					Docker:     tt.dockerConfig,
+					Kubernetes: tt.k8sConfig,
+				},
+			}
+
+			setFipsHelperImageFlavor(cfg, func() bool { return tt.fipsEnabled })
+
+			if cfg.Docker != nil {
+				assert.Equal(t, tt.expectedDockerFlavor, cfg.Docker.HelperImageFlavor)
+			}
+			if cfg.Kubernetes != nil {
+				assert.Equal(t, tt.expectedK8sFlavor, cfg.Kubernetes.HelperImageFlavor)
+			}
+		})
+	}
+}

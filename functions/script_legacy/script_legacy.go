@@ -1,0 +1,182 @@
+package script_legacy
+
+import (
+	"context"
+	"fmt"
+	"path/filepath"
+	"time"
+
+	"google.golang.org/protobuf/types/known/structpb"
+
+	"gitlab.com/gitlab-org/gitlab-runner/functions/script_legacy/internal"
+	"gitlab.com/gitlab-org/step-runner/pkg/runner"
+	"gitlab.com/gitlab-org/step-runner/proto"
+)
+
+// gracefulExitDelay bounds the time the script has between SIGTERM (on
+// cancellation) and SIGKILL of its process group. Also bounds how long we
+// wait for stdout/stderr drain when background processes have inherited
+// the pipe write-ends.
+const gracefulExitDelay = 5 * time.Second
+
+type builtinFunc struct{}
+
+func New() runner.BuiltinFunction { return &builtinFunc{} }
+
+// Spec returns the step specification defining inputs for scriptv2.
+//
+// Inputs:
+//
+//   - script (array, required): Array of shell commands to execute sequentially.
+//     Each command is executed in the same shell session, preserving environment and state.
+//
+//   - debug_trace (boolean, default: false): Enable verbose script execution tracing.
+//     When enabled, adds 'set -o xtrace' to print each command before execution with '+' prefix.
+//     Matches GitLab Runner's CI_DEBUG_TRACE behavior.
+//
+//   - check_for_errors (boolean, default: false): Add explicit exit code checking after each command.
+//     When enabled, captures exit code and fails immediately on non-zero values, not relying solely on errexit.
+//     Matches GitLab Runner's FF_ENABLE_BASH_EXIT_CODE_CHECK feature flag.
+//
+//   - posix_escape (boolean, default: false): Use POSIX-compliant shell escaping without ANSI color codes.
+//     When enabled, uses double-quote escaping compatible with strict POSIX sh (dash, busybox).
+//     When disabled, uses bash-style ANSI-C quoting with color codes.
+//     Matches GitLab Runner's FF_POSIXLY_CORRECT_ESCAPES feature flag.
+//
+//   - trace_sections (boolean, default: false): Wrap multi-line commands in GitLab trace sections.
+//     When enabled, creates collapsible sections in GitLab CI logs for multi-line commands.
+//     Uses GitLab trace section markers (section_start/section_end) with timestamps.
+//     Matches GitLab Runner's FF_SCRIPT_SECTIONS feature flag behavior.
+func (*builtinFunc) Spec() *proto.Spec {
+	return &proto.Spec{
+		Spec: &proto.Spec_Content{
+			Inputs: map[string]*proto.Spec_Content_Input{
+				// script: Array of shell commands to execute sequentially
+				"script": {
+					Type:      proto.ValueType_array,
+					Default:   nil,
+					Sensitive: false,
+				},
+				// debug_trace: Enable verbose script execution tracing (set -o xtrace)
+				"debug_trace": {
+					Type:      proto.ValueType_boolean,
+					Default:   structpb.NewBoolValue(false),
+					Sensitive: false,
+				},
+				// check_for_errors: Add explicit exit code checking after each command
+				"check_for_errors": {
+					Type:      proto.ValueType_boolean,
+					Default:   structpb.NewBoolValue(false),
+					Sensitive: false,
+				},
+				// posix_escape: Use POSIX-compliant escaping without ANSI colors
+				"posix_escape": {
+					Type:      proto.ValueType_boolean,
+					Default:   structpb.NewBoolValue(false),
+					Sensitive: false,
+				},
+				// trace_sections: Wrap multi-line commands in GitLab trace sections
+				"trace_sections": {
+					Type:      proto.ValueType_boolean,
+					Default:   structpb.NewBoolValue(false),
+					Sensitive: false,
+				},
+			},
+		},
+	}
+}
+
+// Run executes the scriptv2 step, generating and running a shell script from the command array.
+func (b *builtinFunc) Run(ctx context.Context, builtinCtx runner.BuiltinContext) (runner.BuiltinResult, error) {
+	// Detect shell early - used by both generator (for shebang) and executor (for execution)
+	shellPath, err := internal.DetectShell()
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("detecting shell: %w", err)
+	}
+
+	scriptInput, err := builtinCtx.GetInput("script", runner.KindList)
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("getting script input: %w", err)
+	}
+
+	var commands []string
+	for _, v := range scriptInput.GetListValue().GetValues() {
+		commands = append(commands, v.GetStringValue())
+	}
+
+	if len(commands) == 0 {
+		return runner.BuiltinResult{}, fmt.Errorf("script input is empty")
+	}
+
+	spec := b.Spec()
+	debugTraceInput, err := builtinCtx.GetInputWithDefault("debug_trace", runner.KindBool, spec.GetSpec().GetInputs())
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("getting debug_trace input: %w", err)
+	}
+	debugTrace := debugTraceInput.GetBoolValue()
+
+	checkForErrorsInput, err := builtinCtx.GetInputWithDefault("check_for_errors", runner.KindBool, spec.GetSpec().GetInputs())
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("getting check_for_errors input: %w", err)
+	}
+	checkForErrors := checkForErrorsInput.GetBoolValue()
+
+	posixEscapeInput, err := builtinCtx.GetInputWithDefault("posix_escape", runner.KindBool, spec.GetSpec().GetInputs())
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("getting posix_escape input: %w", err)
+	}
+	posixEscape := posixEscapeInput.GetBoolValue()
+
+	traceSectionsInput, err := builtinCtx.GetInputWithDefault("trace_sections", runner.KindBool, spec.GetSpec().GetInputs())
+	if err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("getting trace_sections input: %w", err)
+	}
+	traceSections := traceSectionsInput.GetBoolValue()
+
+	// Derive the GITLAB_ENV file path from RUNNER_TEMP_PROJECT_DIR (always
+	// present in job variables) so we can export it and source any KEY=VALUE
+	// pairs written by previous stages. This mirrors AbstractShell.writeExports
+	// for the FF_SCRIPT_TO_STEP_MIGRATION path where each stage runs as a
+	// separate script_legacy invocation.
+	var gitLabEnvFile string
+	if tmpDirVar, ok := builtinCtx.GetJobVars()["RUNNER_TEMP_PROJECT_DIR"]; ok {
+		if tmpDir := tmpDirVar.GetStringValue(); tmpDir != "" {
+			gitLabEnvFile = filepath.Join(tmpDir, "gitlab_runner_env")
+		}
+	}
+
+	generatorConfig := internal.ScriptGeneratorConfig{
+		DebugTrace:     debugTrace,
+		CheckForErrors: checkForErrors,
+		PosixEscape:    posixEscape,
+		TraceSections:  traceSections,
+		ShellPath:      shellPath,
+		GitLabEnvFile:  gitLabEnvFile,
+	}
+	generator := internal.NewScriptGenerator(generatorConfig)
+	script := generator.GenerateScript(commands)
+
+	stdout, stderr := builtinCtx.Pipe()
+	env := builtinCtx.GetEnvList()
+	workDir := builtinCtx.WorkDir()
+
+	// Add job variables to env
+	for key, value := range builtinCtx.GetJobVars() {
+		env = append(env, fmt.Sprintf("%s=%s", key, value.GetStringValue()))
+	}
+
+	executorConfig := internal.ExecutorConfig{
+		Stdout:            stdout,
+		Stderr:            stderr,
+		Env:               env,
+		WorkDir:           workDir,
+		ShellPath:         shellPath,
+		GracefulExitDelay: gracefulExitDelay,
+	}
+	executor := internal.NewExecutor(executorConfig)
+	if err := executor.Execute(ctx, script); err != nil {
+		return runner.BuiltinResult{}, fmt.Errorf("executing script: %w", err)
+	}
+
+	return runner.BuiltinResult{}, nil
+}

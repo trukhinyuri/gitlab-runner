@@ -1,0 +1,871 @@
+//go:build !integration
+
+package volumes
+
+import (
+	"errors"
+	"testing"
+
+	"github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/client"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/labels"
+	"gitlab.com/gitlab-org/gitlab-runner/executors/docker/internal/volumes/parser"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker/test"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/path"
+)
+
+func TestErrVolumeAlreadyDefined(t *testing.T) {
+	err := NewVolumeAlreadyDefinedError("test-path")
+	assert.EqualError(t, err, `volume for container path "test-path" is already defined`)
+}
+
+func TestNewDefaultManager(t *testing.T) {
+	logger := newMockDebugLogger(t)
+
+	m := NewManager(logger, nil, nil, ManagerConfig{}, nil)
+	assert.IsType(t, &manager{}, m)
+}
+
+func newDefaultManager(t *testing.T, config ManagerConfig) *manager {
+	b := &common.Build{
+		Runner: &common.RunnerConfig{},
+	}
+
+	loggerMock := newMockDebugLogger(t)
+	loggerMock.On("Debugln", mock.Anything).Maybe()
+
+	m := &manager{
+		logger:         loggerMock,
+		config:         config,
+		managedVolumes: make(map[string]bool),
+		labeler:        labels.NewLabeler(b),
+	}
+
+	return m
+}
+
+func addUnixParser(t *testing.T, manager *manager) *parser.MockParser {
+	return addParser(t, manager, path.NewUnixPath())
+}
+
+func addParser(t *testing.T, manager *manager, p parser.Path) *parser.MockParser {
+	parserMock := parser.NewMockParser(t)
+	parserMock.On("Path").Return(p)
+
+	manager.parser = parserMock
+	return parserMock
+}
+
+func TestDefaultManager_CreateUserVolumes_HostVolume(t *testing.T) {
+	existingBinding := "/host:/duplicated"
+
+	testCases := map[string]struct {
+		volume          string
+		parsedVolume    *parser.Volume
+		basePath        string
+		expectedBinding []string
+		expectedError   error
+	}{
+		"no volumes specified": {
+			volume:          "",
+			expectedBinding: []string{existingBinding},
+		},
+		"volume with absolute path": {
+			volume:          "/host:/volume",
+			parsedVolume:    &parser.Volume{Source: "/host", Destination: "/volume"},
+			expectedBinding: []string{existingBinding, "/host:/volume"},
+		},
+		"volume with absolute path and with basePath specified": {
+			volume:          "/host:/volume",
+			parsedVolume:    &parser.Volume{Source: "/host", Destination: "/volume"},
+			basePath:        "/builds",
+			expectedBinding: []string{existingBinding, "/host:/volume"},
+		},
+		"volume without absolute path and without basePath specified": {
+			volume:          "/host:volume",
+			parsedVolume:    &parser.Volume{Source: "/host", Destination: "volume"},
+			expectedBinding: []string{existingBinding, "/host:volume"},
+		},
+		"volume without absolute path and with basePath specified": {
+			volume:          "/host:volume",
+			parsedVolume:    &parser.Volume{Source: "/host", Destination: "volume"},
+			basePath:        "/builds/project",
+			expectedBinding: []string{existingBinding, "/host:/builds/project/volume"},
+		},
+		"duplicated volume specification": {
+			volume:          "/host/new:/duplicated",
+			parsedVolume:    &parser.Volume{Source: "/host/new", Destination: "/duplicated"},
+			expectedBinding: []string{existingBinding},
+			expectedError:   NewVolumeAlreadyDefinedError("/duplicated"),
+		},
+		"volume with mode specified": {
+			volume:          "/host/new:/my/path:ro",
+			parsedVolume:    &parser.Volume{Source: "/host/new", Destination: "/my/path", Mode: "ro"},
+			expectedBinding: []string{existingBinding, "/host/new:/my/path:ro"},
+		},
+		"root volume specified": {
+			volume:          "/host/new:/:ro",
+			parsedVolume:    &parser.Volume{Source: "/host/new", Destination: "/", Mode: "ro"},
+			expectedBinding: []string{existingBinding},
+			expectedError:   errDirectoryIsRootPath,
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			config := ManagerConfig{
+				BasePath: testCase.basePath,
+			}
+
+			m := newDefaultManager(t, config)
+
+			volumeParser := addUnixParser(t, m)
+
+			volumeParser.On("ParseVolume", existingBinding).
+				Return(&parser.Volume{Source: "/host", Destination: "/duplicated"}, nil).
+				Once()
+
+			err := m.Create(t.Context(), existingBinding)
+			require.NoError(t, err)
+
+			if testCase.volume != "" {
+				volumeParser.On("ParseVolume", testCase.volume).
+					Return(testCase.parsedVolume, nil).
+					Once()
+			}
+
+			err = m.Create(t.Context(), testCase.volume)
+			assert.ErrorIs(t, err, testCase.expectedError)
+			assert.Equal(t, testCase.expectedBinding, m.volumeBindings)
+		})
+	}
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_Disabled(t *testing.T) {
+	existingBinding := "/host:/duplicated"
+
+	testCases := map[string]struct {
+		volume        string
+		parsedVolume  *parser.Volume
+		basePath      string
+		temporaryName string
+		protected     bool
+
+		expectedVolumeCreateOpts *client.VolumeCreateOptions
+		expectedBindings         []string
+		expectedTemporary        []string
+		expectedError            error
+	}{
+		"no volumes specified": {
+			volume:           "",
+			expectedBindings: []string{existingBinding},
+		},
+		"volume with absolute path, without basePath and with disableCache": {
+			volume:        "/volume",
+			parsedVolume:  &parser.Volume{Destination: "/volume"},
+			basePath:      "",
+			temporaryName: "temporary",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa", map[string]string{
+				"destination": "/volume",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa:/volume",
+			},
+			expectedTemporary: []string{"temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa"},
+		},
+		"volume with absolute path, with basePath and with disableCache": {
+			volume:        "/volume",
+			parsedVolume:  &parser.Volume{Destination: "/volume"},
+			basePath:      "/builds/project",
+			temporaryName: "temporary",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa", map[string]string{
+				"destination": "/volume",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa:/volume",
+			},
+			expectedTemporary: []string{"temporary-cache-14331bf18c8e434c4b3f48a8c5cc79aa"},
+		},
+		"volume without absolute path, without basePath and with disableCache": {
+			volume:        "volume",
+			parsedVolume:  &parser.Volume{Destination: "volume"},
+			temporaryName: "temporary",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-210ab9e731c9c36c2c38db15c28a8d1c", map[string]string{
+				"destination": "volume",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-210ab9e731c9c36c2c38db15c28a8d1c:volume",
+			},
+			expectedTemporary: []string{"temporary-cache-210ab9e731c9c36c2c38db15c28a8d1c"},
+		},
+		"volume without absolute path, with basePath and with disableCache": {
+			volume:        "volume",
+			parsedVolume:  &parser.Volume{Destination: "volume"},
+			basePath:      "/builds/project",
+			temporaryName: "temporary",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+				"destination": "/builds/project/volume",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-f69aef9fb01e88e6213362a04877452d:/builds/project/volume",
+			},
+			expectedTemporary: []string{"temporary-cache-f69aef9fb01e88e6213362a04877452d"},
+		},
+		"duplicated volume definition": {
+			volume:           "/duplicated",
+			parsedVolume:     &parser.Volume{Destination: "/duplicated"},
+			basePath:         "",
+			temporaryName:    "temporary",
+			expectedBindings: []string{existingBinding},
+			expectedError:    NewVolumeAlreadyDefinedError("/duplicated"),
+		},
+		"volume is root": {
+			volume:           "/",
+			parsedVolume:     &parser.Volume{Destination: "/"},
+			temporaryName:    "temporary",
+			expectedBindings: []string{existingBinding},
+			expectedError:    errDirectoryIsRootPath,
+		},
+		"protected": {
+			volume:        "some-volume",
+			parsedVolume:  &parser.Volume{Destination: "some-volume"},
+			basePath:      "/some/base/path",
+			temporaryName: "some-temporary",
+			protected:     true,
+			expectedVolumeCreateOpts: testVolumeCreatOpts("some-temporary-cache-804b0f6b0d757899a37145f9d7f3848e-protected", map[string]string{
+				"destination": "/some/base/path/some-volume",
+				"protected":   "true",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"some-temporary-cache-804b0f6b0d757899a37145f9d7f3848e-protected:/some/base/path/some-volume",
+			},
+			expectedTemporary: []string{"some-temporary-cache-804b0f6b0d757899a37145f9d7f3848e-protected"},
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			config := ManagerConfig{
+				BasePath:      testCase.basePath,
+				DisableCache:  true,
+				TemporaryName: testCase.temporaryName,
+				Protected:     testCase.protected,
+			}
+
+			m := newDefaultManager(t, config)
+			volumeParser := addUnixParser(t, m)
+			mClient := docker.NewMockClient(t)
+			m.client = mClient
+
+			volumeParser.On("ParseVolume", "/host:/duplicated").
+				Return(&parser.Volume{Source: "/host", Destination: "/duplicated"}, nil).
+				Once()
+
+			if createOpts := testCase.expectedVolumeCreateOpts; createOpts != nil {
+				mClient.
+					On("VolumeCreate", mock.Anything, *createOpts).
+					Return(volume.Volume{Name: createOpts.Name}, nil).
+					Once()
+			}
+
+			err := m.Create(t.Context(), "/host:/duplicated")
+			require.NoError(t, err)
+
+			if testCase.volume != "" {
+				volumeParser.On("ParseVolume", testCase.volume).
+					Return(testCase.parsedVolume, nil).
+					Once()
+			}
+
+			err = m.Create(t.Context(), testCase.volume)
+			if testCase.expectedError != nil {
+				assert.ErrorIs(t, err, testCase.expectedError)
+			} else {
+				assert.NoError(t, err)
+			}
+
+			assert.Equal(t, testCase.expectedBindings, m.Binds())
+			assert.Equal(t, testCase.expectedTemporary, m.temporaryVolumes)
+		})
+	}
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_HostBased(t *testing.T) {
+	existingBinding := "/host:/duplicated"
+
+	testCases := map[string]struct {
+		volume     string
+		basePath   string
+		uniqueName string
+		protected  bool
+
+		expectedBinding []string
+		expectedError   error
+	}{
+		"volume with absolute path, without basePath": {
+			volume:     "/volume",
+			uniqueName: "uniq",
+			expectedBinding: []string{
+				existingBinding,
+				"/cache/uniq/14331bf18c8e434c4b3f48a8c5cc79aa:/volume",
+			},
+		},
+		"volume with absolute path, with basePath": {
+			volume:     "/volume",
+			basePath:   "/builds/project",
+			uniqueName: "uniq",
+			expectedBinding: []string{
+				existingBinding,
+				"/cache/uniq/14331bf18c8e434c4b3f48a8c5cc79aa:/volume",
+			},
+		},
+		"volume without absolute path, without basePath": {
+			volume:     "volume",
+			uniqueName: "uniq",
+			expectedBinding: []string{
+				existingBinding,
+				"/cache/uniq/210ab9e731c9c36c2c38db15c28a8d1c:volume",
+			},
+		},
+		"volume without absolute path, with basePath": {
+			volume:     "volume",
+			basePath:   "/builds/project",
+			uniqueName: "uniq",
+			expectedBinding: []string{
+				existingBinding,
+				"/cache/uniq/f69aef9fb01e88e6213362a04877452d:/builds/project/volume",
+			},
+		},
+		"duplicated volume definition": {
+			volume:          "/duplicated",
+			uniqueName:      "uniq",
+			expectedBinding: []string{existingBinding},
+			expectedError:   NewVolumeAlreadyDefinedError("/duplicated"),
+		},
+		"volume is root": {
+			volume:          "/",
+			expectedBinding: []string{existingBinding},
+			expectedError:   errDirectoryIsRootPath,
+		},
+		"protected": {
+			volume:     "some-volume",
+			basePath:   "/some/base/path",
+			uniqueName: "some-unique-name",
+			protected:  true,
+			expectedBinding: []string{
+				existingBinding,
+				"/cache/some-unique-name/804b0f6b0d757899a37145f9d7f3848e-protected:/some/base/path/some-volume",
+			},
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			config := ManagerConfig{
+				BasePath:     testCase.basePath,
+				DisableCache: false,
+				CacheDir:     "/cache",
+				UniqueName:   testCase.uniqueName,
+				Protected:    testCase.protected,
+			}
+
+			m := newDefaultManager(t, config)
+
+			volumeParser := addUnixParser(t, m)
+
+			volumeParser.On("ParseVolume", existingBinding).
+				Return(&parser.Volume{Source: "/host", Destination: "/duplicated"}, nil).
+				Once()
+
+			err := m.Create(t.Context(), existingBinding)
+			require.NoError(t, err)
+
+			volumeParser.On("ParseVolume", testCase.volume).
+				Return(&parser.Volume{Destination: testCase.volume}, nil).
+				Once()
+
+			err = m.Create(t.Context(), testCase.volume)
+			assert.ErrorIs(t, err, testCase.expectedError)
+			assert.Equal(t, testCase.expectedBinding, m.volumeBindings)
+		})
+	}
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_VolumeBased(t *testing.T) {
+	existingBinding := "/host:/duplicated"
+
+	testCases := map[string]struct {
+		volume     string
+		basePath   string
+		uniqueName string
+		protected  bool
+
+		expectedVolumeCreateOpts *client.VolumeCreateOptions
+		expectedBindings         []string
+		expectedError            error
+	}{
+		"volume with absolute path, without basePath and with existing volume": {
+			volume:     "/volume",
+			basePath:   "",
+			uniqueName: "uniq",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("uniq-cache-14331bf18c8e434c4b3f48a8c5cc79aa", map[string]string{
+				"destination": "/volume",
+				"reusable":    "true",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"uniq-cache-14331bf18c8e434c4b3f48a8c5cc79aa:/volume",
+			},
+		},
+		"volume without absolute path, with basePath": {
+			volume:     "volume",
+			basePath:   "/builds/project",
+			uniqueName: "uniq",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("uniq-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+				"destination": "/builds/project/volume",
+				"reusable":    "true",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"uniq-cache-f69aef9fb01e88e6213362a04877452d:/builds/project/volume",
+			},
+		},
+		"volume is root": {
+			volume:        "/",
+			basePath:      "",
+			uniqueName:    "uniq",
+			expectedError: errDirectoryIsRootPath,
+		},
+		"duplicated volume definition": {
+			volume:        "/duplicated",
+			uniqueName:    "uniq",
+			expectedError: NewVolumeAlreadyDefinedError("/duplicated"),
+		},
+		"protected": {
+			volume:     "some/volume",
+			basePath:   "/some/base/path",
+			uniqueName: "some-unique-name",
+			protected:  true,
+			expectedVolumeCreateOpts: testVolumeCreatOpts("some-unique-name-cache-7ee4ee58453a23f50e3e88641d9e4690-protected", map[string]string{
+				"destination": "/some/base/path/some/volume",
+				"protected":   "true",
+				"reusable":    "true",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"some-unique-name-cache-7ee4ee58453a23f50e3e88641d9e4690-protected:/some/base/path/some/volume",
+			},
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			config := ManagerConfig{
+				BasePath:     testCase.basePath,
+				UniqueName:   testCase.uniqueName,
+				DisableCache: false,
+				Protected:    testCase.protected,
+			}
+
+			m := newDefaultManager(t, config)
+			volumeParser := addUnixParser(t, m)
+			mClient := docker.NewMockClient(t)
+			m.client = mClient
+
+			volumeParser.On("ParseVolume", existingBinding).
+				Return(&parser.Volume{Source: "/host", Destination: "/duplicated"}, nil).
+				Once()
+			volumeParser.On("ParseVolume", testCase.volume).
+				Return(&parser.Volume{Destination: testCase.volume}, nil).
+				Once()
+
+			if createOpts := testCase.expectedVolumeCreateOpts; createOpts != nil {
+				mClient.
+					On("VolumeCreate", mock.Anything, *createOpts).
+					Return(volume.Volume{Name: createOpts.Name}, nil).
+					Once()
+			}
+
+			err := m.Create(t.Context(), existingBinding)
+			require.NoError(t, err)
+
+			err = m.Create(t.Context(), testCase.volume)
+			if testCase.expectedError != nil {
+				assert.ErrorIs(t, err, testCase.expectedError)
+				return
+			}
+
+			assert.NoError(t, err)
+			assert.Equal(t, testCase.expectedBindings, m.Binds())
+		})
+	}
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_VolumeBased_WithError(t *testing.T) {
+	testErr := errors.New("test-error")
+	config := ManagerConfig{
+		BasePath:   "/builds/project",
+		UniqueName: "unique",
+	}
+
+	m := newDefaultManager(t, config)
+	volumeParser := addUnixParser(t, m)
+	mClient := docker.NewMockClient(t)
+	m.client = mClient
+
+	expectedCreateOpts := testVolumeCreatOpts("unique-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+		"destination": "/builds/project/volume",
+		"reusable":    "true",
+	})
+	mClient.
+		On("VolumeCreate", mock.Anything, *expectedCreateOpts).
+		Return(volume.Volume{}, testErr).
+		Once()
+
+	volumeParser.On("ParseVolume", "volume").
+		Return(&parser.Volume{Destination: "volume"}, nil).
+		Once()
+
+	err := m.Create(t.Context(), "volume")
+	assert.ErrorIs(t, err, testErr)
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_Disabled_WithError(t *testing.T) {
+	testErr := errors.New("test-error")
+	config := ManagerConfig{
+		BasePath:      "/builds/project",
+		TemporaryName: "temporary",
+		DisableCache:  true,
+	}
+
+	m := newDefaultManager(t, config)
+	volumeParser := addUnixParser(t, m)
+	mClient := docker.NewMockClient(t)
+	m.client = mClient
+
+	expectedCreateOpts := testVolumeCreatOpts("temporary-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+		"destination": "/builds/project/volume",
+	})
+	mClient.
+		On("VolumeCreate", mock.Anything, *expectedCreateOpts).
+		Return(volume.Volume{}, testErr).
+		Once()
+
+	volumeParser.On("ParseVolume", "volume").
+		Return(&parser.Volume{Destination: "volume"}, nil).
+		Once()
+
+	err := m.Create(t.Context(), "volume")
+	assert.ErrorIs(t, err, testErr)
+	assert.Empty(t, m.Binds())
+	assert.Empty(t, m.temporaryVolumes)
+}
+
+func TestDefaultManager_CreateUserVolumes_CacheVolume_Disabled_TracksTemporaryVolumesForCleanup(t *testing.T) {
+	config := ManagerConfig{
+		BasePath:      "/builds/project",
+		TemporaryName: "temporary",
+		DisableCache:  true,
+	}
+
+	m := newDefaultManager(t, config)
+	volumeParser := addUnixParser(t, m)
+	mClient := docker.NewMockClient(t)
+	m.client = mClient
+
+	createOpts := testVolumeCreatOpts("temporary-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+		"destination": "/builds/project/volume",
+	})
+
+	volumeParser.On("ParseVolume", "volume").
+		Return(&parser.Volume{Destination: "volume"}, nil).Once()
+
+	mClient.On("VolumeCreate", mock.Anything, *createOpts).
+		Return(volume.Volume{Name: createOpts.Name}, nil).Once()
+	mClient.On("VolumeRemove", mock.Anything, createOpts.Name, true).
+		Return(nil).Once()
+
+	err := m.Create(t.Context(), "volume")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{createOpts.Name}, m.temporaryVolumes)
+	assert.Equal(t, []string{
+		createOpts.Name + ":/builds/project/volume",
+	}, m.Binds())
+
+	err = m.RemoveTemporary(t.Context())
+	assert.NoError(t, err)
+}
+
+func TestDefaultManager_CreateUserVolumes_ParserError(t *testing.T) {
+	testErr := errors.New("parser-test-error")
+	m := newDefaultManager(t, ManagerConfig{})
+
+	volumeParser := parser.NewMockParser(t)
+	m.parser = volumeParser
+
+	volumeParser.On("ParseVolume", "volume").
+		Return(nil, testErr).
+		Once()
+
+	err := m.Create(t.Context(), "volume")
+	assert.ErrorIs(t, err, testErr)
+}
+
+func TestDefaultManager_CreateTemporary(t *testing.T) {
+	volumeCreateErr := errors.New("volume-create")
+	existingBinding := "/host:/duplicated"
+
+	testCases := map[string]struct {
+		volume          string
+		volumeCreateErr error
+		protected       bool
+
+		expectedVolumeCreateOpts *client.VolumeCreateOptions
+		expectedBindings         []string
+		expectedTemporary        []string
+		expectedError            error
+	}{
+		"volume created": {
+			volume: "volume",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+				"destination": "/builds/project/volume",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-f69aef9fb01e88e6213362a04877452d:/builds/project/volume",
+			},
+		},
+		"volume root": {
+			volume:        "/",
+			expectedError: errDirectoryIsRootPath,
+		},
+		"volume creation error": {
+			volume: "volume",
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-f69aef9fb01e88e6213362a04877452d", map[string]string{
+				"destination": "/builds/project/volume",
+			}),
+			volumeCreateErr: volumeCreateErr,
+			expectedError:   volumeCreateErr,
+		},
+		"duplicated volume definition": {
+			volume:        "/duplicated",
+			expectedError: &VolumeAlreadyDefinedError{},
+		},
+		"protected": {
+			volume:    "some/volume",
+			protected: true,
+			expectedVolumeCreateOpts: testVolumeCreatOpts("temporary-cache-12b6275e06323d2d4872c0c352d0c7dd-protected", map[string]string{
+				"destination": "/builds/project/some/volume",
+				"protected":   "true",
+			}),
+			expectedBindings: []string{
+				existingBinding,
+				"temporary-cache-12b6275e06323d2d4872c0c352d0c7dd-protected:/builds/project/some/volume",
+			},
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			config := ManagerConfig{
+				BasePath:      "/builds/project",
+				TemporaryName: "temporary",
+				Protected:     testCase.protected,
+			}
+
+			m := newDefaultManager(t, config)
+			volumeParser := addUnixParser(t, m)
+			mClient := docker.NewMockClient(t)
+			m.client = mClient
+
+			volumeParser.On("ParseVolume", existingBinding).
+				Return(&parser.Volume{Source: "/host", Destination: "/duplicated"}, nil).
+				Once()
+
+			var expectedVolumeName string
+			if createOpts := testCase.expectedVolumeCreateOpts; createOpts != nil {
+				expectedVolumeName = createOpts.Name
+				mClient.
+					On("VolumeCreate", mock.Anything, *createOpts).
+					Return(volume.Volume{Name: createOpts.Name}, testCase.volumeCreateErr).
+					Once()
+			}
+
+			err := m.Create(t.Context(), existingBinding)
+			require.NoError(t, err)
+
+			err = m.CreateTemporary(t.Context(), testCase.volume)
+			if testCase.expectedError != nil {
+				assert.ErrorIs(t, err, testCase.expectedError)
+				return
+			}
+
+			require.Len(t, m.temporaryVolumes, 1)
+			assert.Equal(t, m.temporaryVolumes[0], expectedVolumeName)
+			assert.ErrorIs(t, err, testCase.expectedError)
+			assert.Equal(t, testCase.expectedBindings, m.Binds())
+		})
+	}
+}
+
+func TestDefaultManager_RemoveTemporary(t *testing.T) {
+	testErr := errors.New("test-err")
+	testCases := map[string]struct {
+		temporaryVolumes []string
+		clientAssertions func(*docker.MockClient)
+		expectedError    error
+	}{
+		"no volumes to remove": {
+			temporaryVolumes: []string{},
+			clientAssertions: func(c *docker.MockClient) {},
+			expectedError:    nil,
+		},
+		"all volumes removed": {
+			temporaryVolumes: []string{"volume1", "volume2", "volume3"},
+			clientAssertions: func(c *docker.MockClient) {
+				c.On("VolumeRemove", mock.Anything, "volume1", true).Return(nil).Once()
+				c.On("VolumeRemove", mock.Anything, "volume2", true).Return(nil).Once()
+				c.On("VolumeRemove", mock.Anything, "volume3", true).Return(nil).Once()
+			},
+			expectedError: nil,
+		},
+		"volume not found": {
+			temporaryVolumes: []string{"nonexistent-volume"},
+			clientAssertions: func(c *docker.MockClient) {
+				c.On("VolumeRemove", mock.Anything, "nonexistent-volume", true).Return(&test.NotFoundError{}).Once()
+			},
+			expectedError: &test.NotFoundError{},
+		},
+		"failed to remove volume": {
+			temporaryVolumes: []string{"volume-name-1"},
+			clientAssertions: func(c *docker.MockClient) {
+				c.On("VolumeRemove", mock.Anything, "volume-name-1", true).Return(testErr).Once()
+			},
+			expectedError: testErr,
+		},
+	}
+
+	for testName, testCase := range testCases {
+		t.Run(testName, func(t *testing.T) {
+			mClient := docker.NewMockClient(t)
+
+			testCase.clientAssertions(mClient)
+
+			m := newDefaultManager(t, ManagerConfig{})
+			m.client = mClient
+			m.temporaryVolumes = testCase.temporaryVolumes
+
+			err := m.RemoveTemporary(t.Context())
+			assert.ErrorIs(t, err, testCase.expectedError)
+		})
+	}
+}
+
+func TestDefaultManager_Binds(t *testing.T) {
+	expectedElements := []string{"element1", "element2"}
+	m := &manager{
+		volumeBindings: expectedElements,
+	}
+
+	assert.Equal(t, expectedElements, m.Binds())
+}
+
+func testVolumeCreatOpts(name string, additionalLabels map[string]string) *client.VolumeCreateOptions {
+	const pre = "com.gitlab.gitlab-runner"
+	labels := map[string]string{
+		pre + ".type":              "cache",
+		pre + ".job.before_sha":    "",
+		pre + ".job.id":            "0",
+		pre + ".job.ref":           "",
+		pre + ".job.sha":           "",
+		pre + ".job.url":           "/-/jobs/0",
+		pre + ".job.timeout":       "2h0m0s",
+		pre + ".managed":           "true",
+		pre + ".pipeline.id":       "",
+		pre + ".project.id":        "0",
+		pre + ".project.runner_id": "0",
+		pre + ".protected":         "false",
+		pre + ".reusable":          "false",
+		pre + ".runner.id":         "",
+		pre + ".runner.local_id":   "0",
+		pre + ".runner.system_id":  "",
+		pre + ".destination":       "",
+	}
+
+	for k, v := range additionalLabels {
+		labels[pre+"."+k] = v
+	}
+
+	return &client.VolumeCreateOptions{
+		Name:   name,
+		Labels: labels,
+	}
+}
+
+func TestAdopt_volumeMissing(t *testing.T) {
+	m := newDefaultManager(t, ManagerConfig{})
+	mClient := docker.NewMockClient(t)
+	m.client = mClient
+
+	mounts := []container.MountPoint{
+		{Type: mount.TypeVolume, Name: "missing-vol", Source: "/var/lib/docker/volumes/missing-vol/_data", Destination: "/builds"},
+	}
+
+	mClient.On("VolumeInspect", mock.Anything, "missing-vol").
+		Return(volume.Volume{}, errdefs.ErrNotFound).Once()
+
+	err := m.Adopt(t.Context(), mounts)
+	require.Error(t, err)
+	require.EqualError(t, err, "volume missing-vol not found: not found")
+}
+
+func TestAdopt_unsupportedMountType(t *testing.T) {
+	m := newDefaultManager(t, ManagerConfig{})
+
+	mounts := []container.MountPoint{
+		{Type: mount.TypeTmpfs, Destination: "/tmp"},
+	}
+
+	err := m.Adopt(t.Context(), mounts)
+	require.EqualError(t, err, "unsupported mount type tmpfs for /tmp")
+}
+
+func TestAdopt_mixedMounts(t *testing.T) {
+	m := newDefaultManager(t, ManagerConfig{})
+	mClient := docker.NewMockClient(t)
+	m.client = mClient
+
+	mounts := []container.MountPoint{
+		{Type: mount.TypeVolume, Name: "named-a", Source: "/var/lib/docker/volumes/named-a/_data", Destination: "/a"},
+		{Type: mount.TypeBind, Source: "/host-ro", Destination: "/ro-mount", Mode: "ro"},
+		{Type: mount.TypeBind, Source: "/host-rw", Destination: "/rw-mount"},
+		{Type: mount.TypeVolume, Name: "named-b", Source: "/var/lib/docker/volumes/named-b/_data", Destination: "/b"},
+	}
+
+	reusableKey := m.labeler.LabelKey("reusable")
+	mClient.On("VolumeInspect", mock.Anything, "named-a").
+		Return(volume.Volume{Name: "named-a", Labels: map[string]string{reusableKey: "true"}}, nil).Once()
+	mClient.On("VolumeInspect", mock.Anything, "named-b").
+		Return(volume.Volume{Name: "named-b", Labels: map[string]string{reusableKey: "false"}}, nil).Once()
+
+	require.NoError(t, m.Adopt(t.Context(), mounts))
+	assert.ElementsMatch(t,
+		[]string{"named-a:/a", "/host-ro:/ro-mount:ro", "/host-rw:/rw-mount", "named-b:/b"},
+		m.Binds())
+	assert.Equal(t, []string{"named-b"}, m.temporaryVolumes)
+}

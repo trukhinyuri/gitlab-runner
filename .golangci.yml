@@ -1,0 +1,156 @@
+version: "2"
+run:
+  concurrency: 8
+  build-tags:
+    - network_faults
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - dogsled
+    - errcheck
+    - errname
+    - errorlint
+    - gocognit
+    - gocritic
+    - goprintffuncname
+    - govet
+    - ineffassign
+    - misspell
+    - modernize
+    - nakedret
+    - nestif
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - usetesting
+    - wastedassign
+    - whitespace
+  settings:
+    errcheck:
+      check-type-assertions: true
+    errorlint:
+      asserts: false
+      comparison: false
+    gocognit:
+      min-complexity: 15
+    gocritic:
+      enabled-checks:
+        - appendCombine
+        - boolExprSimplify
+        - commentedOutCode
+        - dupImport
+        - emptyFallthrough
+        - emptyStringTest
+        - equalFold
+        - evalOrder
+        - hexLiteral
+        - indexAlloc
+        - initClause
+        - methodExprCall
+        - nestingReduce
+        - nilValReturn
+        - ptrToRefParam
+        - rangeExprCopy
+        - regexpPattern
+        - sloppyReassign
+        - stringXbytes
+        - truncateCmp
+        - typeAssertChain
+        - typeUnparen
+        - unnecessaryBlock
+        - weakCond
+        - yodaStyleExpr
+    gocyclo:
+      min-complexity: 10
+    modernize:
+      # analyzers will be enabled as issues are resolved
+      disable:
+        - atomictypes
+        - fmtappendf
+    revive:
+      rules:
+        - name: unused-parameter
+          disabled: true
+    staticcheck:
+      checks: ["all", "-ST1000", "-ST1003", "-ST1005", "-ST1012", "-ST1016", "-ST1020", "-ST1021", "-ST1022", "-QF1001", "-QF1008", "-QF1011"]
+    usetesting:
+      os-create-temp: false
+      os-mkdir-temp: false
+      os-setenv: false
+      os-temp-dir: false
+      os-chdir: false
+      context-background: true
+      context-todo: true
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    rules:
+      - linters:
+          - gocyclo
+        path: helpers/shell_escape.go
+      - linters:
+          - gocyclo
+        path: executors/kubernetes/kubernetes_test.go
+      - linters:
+          - gocyclo
+        path: executors/kubernetes/util_test.go
+      - linters:
+          - gocyclo
+        path: executors/kubernetes/exec_test.go
+      - linters:
+          - gocyclo
+        path: executors/parallels/
+      - linters:
+          - gocyclo
+        path: executors/virtualbox/
+      - linters:
+          - revive
+        text: don't use ALL_CAPS in Go names; use CamelCase
+      - linters:
+          - revive
+        text: don't use an underscore in package name
+      - linters:
+          - bodyclose
+          - gocognit
+          - goconst
+        path: .*_test.go
+      - linters:
+          - errcheck
+        path: .*_test.go
+        text: Error return value is not checked
+      - linters:
+          - errcheck
+          - gocritic
+        path: .*_test.go
+        text: regexpMust
+      - linters:
+          - gocritic
+        path: .*_test.go
+        text: typeUnparen
+      - linters:
+          - unused
+        path: executors/docker/docker_command_test.go # Ignore until https://gitlab.com/gitlab-org/gitlab-runner/-/issues/25385 is solved
+    paths:
+      - mock_*.go
+      - third_party$
+      - builtin$
+      - examples$
+formatters:
+  enable:
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - mock_*.go
+      - third_party$
+      - builtin$
+      - examples$

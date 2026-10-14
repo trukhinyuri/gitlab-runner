@@ -1,0 +1,18 @@
+source_language: en-us
+target_languages: [fr-fr, ja-jp, ko-kr]
+argo_request_key: GITTECH
+translation_mr_labels: [gitlab-translation-service]
+translation_mr_branch_name: docs-i18n/
+pipelines:
+  request_template_key: GITTECHC
+components:
+  - name: Technical Documentation
+    create_request: false
+    paths:
+      - source: "docs/**/*.md"
+        target: "docs-locale/{{language}}/"
+    ignored_paths:
+      - "docs/.*/**"
+      - 'docs/development/**'
+      - 'docs/CLAUDE.md'
+      - 'docs/SKILLS.md'

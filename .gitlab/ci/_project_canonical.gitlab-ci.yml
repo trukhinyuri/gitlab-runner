@@ -1,0 +1,8 @@
+.instance-default: $RUNNER_TAG_DEFAULT
+.instance-default-docker: $RUNNER_TAG_DOCKER
+
+.instance-2xlarge: $RUNNER_TAG_2XLARGE
+.instance-medium: $RUNNER_TAG_MEDIUM
+
+.instance-windows-2019: $RUNNER_TAG_WINDOWS_2019
+.instance-windows-2022: $RUNNER_TAG_WINDOWS_2022

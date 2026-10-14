@@ -1,0 +1,1026 @@
+package machine
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/sirupsen/logrus"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/docker"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/featureflags"
+)
+
+// targetLabelNames is the fixed schema of dynamic labels attached to the
+// gitlab_runner_autoscaling_actions_total counter. Values are read off
+// the docker-machine state file (config.json) via Machine.Inspect — see
+// targetLabelsFromInspect. There is intentionally no operator config knob
+// for these: the values reflect what was actually provisioned (or, on
+// creation-failed paths, what was attempted), so any operator-supplied
+// static defaults would just be a drift risk.
+var targetLabelNames = []string{
+	"target_zone",
+	"target_region",
+	"target_project",
+	"target_machine_type",
+}
+
+// targetLabels holds the values for targetLabelNames in the same order.
+// Cached on machineDetails so used / removed emissions later in the
+// lifecycle don't need to re-Inspect.
+type targetLabels struct {
+	zone, region, project, machineType string
+}
+
+// values returns the label values in targetLabelNames order.
+func (t targetLabels) values() []string {
+	return []string{t.zone, t.region, t.project, t.machineType}
+}
+
+// targetLabelsFromInspectFn populates a targetLabels from driver state.
+// Different drivers expose different fields; one function per driver
+// keeps driver-specific logic isolated.
+type targetLabelsFromInspectFn func(docker.MachineInfo) targetLabels
+
+// targetLabelsFromInspectByDriver dispatches to a per-driver populator.
+// Missing drivers return empty labels.
+var targetLabelsFromInspectByDriver = map[string]targetLabelsFromInspectFn{
+	"google": targetLabelsFromInspectGoogle,
+}
+
+// targetLabelsFromInspect dispatches to the driver-specific populator
+// or returns empty labels for unknown drivers.
+func targetLabelsFromInspect(info docker.MachineInfo) targetLabels {
+	if fn, ok := targetLabelsFromInspectByDriver[info.DriverName]; ok {
+		return fn(info)
+	}
+	return targetLabels{}
+}
+
+// targetLabelsFromInspectGoogle derives metric labels from a GCE
+// machine state. GCE zones are `<region>-<letter>`; the region is the
+// prefix before the trailing `-X`.
+func targetLabelsFromInspectGoogle(info docker.MachineInfo) targetLabels {
+	out := targetLabels{
+		zone:        info.Zone,
+		project:     info.Project,
+		machineType: info.MachineType,
+	}
+	if i := strings.LastIndex(info.Zone, "-"); i > 0 {
+		out.region = info.Zone[:i]
+	}
+	return out
+}
+
+// actionLabels combines the action value with cached target labels to
+// produce the full label-values slice for WithLabelValues, in the order
+// matching newMachineProvider's CounterVec schema.
+func actionLabels(action string, t targetLabels) []string {
+	return append([]string{action}, t.values()...)
+}
+
+type machineProvider struct {
+	name        string
+	machine     docker.Machine
+	details     machinesDetails
+	runners     runnersDetails
+	lock        sync.RWMutex
+	acquireLock sync.Mutex
+	// provider stores a real executor that is used to start run the builds
+	provider common.ExecutorProvider
+
+	stuckRemoveLock sync.Mutex
+
+	heartbeatersLock sync.Mutex
+	heartbeaters     map[string]*heartbeater
+	heartbeatSem     chan struct{}
+
+	machineMetrics
+	autoscalingLimitsLock sync.Mutex
+	autoscalingLimits     map[string]autoscalingLimits
+
+	startedAt  time.Time
+	warmupLock sync.Mutex
+	warmups    map[string]*warmupState
+
+	// Acquire refuses once set, so a worker that raced the stop signal does not refill the pool.
+	shuttingDown atomic.Bool
+	drainLock    sync.Mutex
+	drain        *shutdownDrain
+}
+
+type autoscalingLimits struct {
+	runnerName    string
+	systemID      string
+	maxGrowthRate float64
+	idleTarget    float64
+	warmupEnabled bool
+	updatedAt     time.Time
+}
+
+// Entries not refreshed by Acquire within this window were removed from the
+// config. Assumes check_interval (default 3s) stays well below this TTL.
+const autoscalingLimitsTTL = 10 * time.Minute
+
+func (m *machineProvider) machineDetails(name string, acquire bool) *machineDetails {
+	details := m.ensureDetails(name)
+	if acquire {
+		details = m.tryAcquireMachineDetails(details)
+	}
+
+	return details
+}
+
+func (m *machineProvider) ensureDetails(name string) *machineDetails {
+	m.lock.Lock()
+	if details, ok := m.details[name]; ok {
+		m.lock.Unlock()
+		return details
+	}
+
+	now := time.Now()
+	details := &machineDetails{
+		Name:      name,
+		Created:   now,
+		Used:      now,
+		LastSeen:  now,
+		UsedCount: 1, // any machine that we find we mark as already used
+		State:     machineStateIdle,
+	}
+	m.details[name] = details
+	m.lock.Unlock()
+
+	// Populate target labels from on-disk state. Inspect happens after
+	// we drop the provider-wide lock; the brief window where an entry
+	// has empty targets is benign (metrics emit empty labels, same as
+	// pre-MR behaviour). For brand-new entries created here, config.json
+	// may not exist yet — Inspect fails silently and targets stay empty
+	// until createWithGrowthCapacity re-Inspects post-Create.
+	if info, err := m.machine.Inspect(name); err == nil {
+		details.Lock()
+		details.targets = targetLabelsFromInspect(info)
+		details.Unlock()
+	}
+
+	return details
+}
+
+var errNoConfig = errors.New("no runner config specified")
+
+func (m *machineProvider) runnerMachinesCoordinator(config *common.RunnerConfig) (*runnerMachinesCoordinator, error) {
+	if config == nil {
+		return nil, errNoConfig
+	}
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	details, ok := m.runners[config.GetToken()]
+	if !ok {
+		details = newRunnerMachinesCoordinator()
+		m.runners[config.GetToken()] = details
+	}
+
+	return details, nil
+}
+
+func (m *machineProvider) create(
+	config *common.RunnerConfig,
+	state machineState,
+	pendingUse bool,
+	warmup *warmupLimits,
+) (*machineDetails, chan error) {
+	name := newMachineName(config)
+	done := make(chan struct{})
+	now := time.Now()
+	details := &machineDetails{
+		Name:               name,
+		Created:            now,
+		Used:               now,
+		LastSeen:           now,
+		State:              machineStateCreating,
+		pendingUse:         pendingUse,
+		maxRemovalAttempts: config.Machine.MaxRemovalAttempts,
+		removeWithoutStop:  config.Machine.RemoveWithoutStop,
+		inFlight:           done,
+	}
+	m.lock.Lock()
+	m.details[name] = details
+	m.lock.Unlock()
+	errCh := make(chan error, 1)
+
+	// Create machine with the required configuration asynchronously
+	coordinator, err := m.runnerMachinesCoordinator(config)
+	if err != nil {
+		close(done)
+		errCh <- err
+		return nil, errCh
+	}
+
+	go coordinator.waitForGrowthCapacity(maxGrowthRate(config, warmup), func() {
+		defer close(done)
+		m.createWithGrowthCapacity(coordinator, config, details, state, errCh)
+	})
+
+	return details, errCh
+}
+
+// machineNameVariable expands to the machine's name instead of an
+// environment variable.
+const machineNameVariable = "GITLAB_RUNNER_MACHINE_NAME"
+
+func machineOptions(config *common.RunnerConfig, name string) []string {
+	opts := make([]string, 0, len(config.Machine.MachineOptions)+len(config.Machine.MachineOptionsWithName))
+	opts = append(opts, config.Machine.MachineOptions...)
+	for _, tpl := range config.Machine.MachineOptionsWithName {
+		opts = append(opts, fmt.Sprintf(tpl, name))
+	}
+
+	if !config.IsFeatureFlagOn(featureflags.MachineOptionsExpandEnv) {
+		return opts
+	}
+
+	for i, opt := range opts {
+		opts[i] = os.Expand(opt, func(variable string) string {
+			if variable == machineNameVariable {
+				return name
+			}
+
+			return os.Getenv(variable)
+		})
+	}
+
+	return opts
+}
+
+func (m *machineProvider) createWithGrowthCapacity(
+	coordinator *runnerMachinesCoordinator,
+	config *common.RunnerConfig,
+	details *machineDetails,
+	state machineState,
+	errCh chan error,
+) {
+	logger := logrus.WithField("name", details.Name)
+	started := time.Now()
+
+	ctx, ctxCancelFn := context.WithTimeout(context.Background(), machineCreateCommandTimeout)
+	defer ctxCancelFn()
+
+	opts := machineOptions(config, details.Name)
+	phases := newPhaseTracker()
+
+	var output docker.MachineOutput
+	if config.IsFeatureFlagOn(featureflags.DockerMachineJSONOutput) {
+		output = docker.MachineOutput{JSONLogFormat: true, OnEntry: phases.observe}
+	}
+
+	err := m.machine.Create(ctx, config.Machine.MachineDriver, details.Name, output, opts...)
+	phaseDurations := phases.finish(time.Now())
+
+	// Inspect post-Create regardless of outcome. libmachine saves state
+	// both pre-create and on failure, so creation-failed counters get
+	// dimensional labels too. Missing state leaves targets empty.
+	if info, inspectErr := m.machine.Inspect(details.Name); inspectErr == nil {
+		details.Lock()
+		details.targets = targetLabelsFromInspect(info)
+		details.Unlock()
+	} else {
+		logger.WithError(inspectErr).
+			Warnln("Could not inspect docker-machine state; emitting metric with empty target labels")
+	}
+
+	result := "success"
+	if err != nil {
+		result = "failure"
+	}
+	if m.creationPhaseHistogram != nil {
+		targets := details.targets.values()
+		for phase, seconds := range phaseDurations {
+			m.creationPhaseHistogram.
+				WithLabelValues(append([]string{phase, result}, targets...)...).
+				Observe(seconds)
+		}
+	}
+	if len(phaseDurations) > 0 {
+		logger = logger.WithField("phases", phaseDurations)
+	}
+
+	if err != nil {
+		logger.WithField("time", time.Since(started)).
+			WithError(err).
+			Errorln("Machine creation failed")
+		m.totalActions.WithLabelValues(actionLabels("creation-failed", details.targets)...).Inc()
+		m.failedCreationHistogram.WithLabelValues(details.targets.values()...).Observe(time.Since(started).Seconds())
+		m.warmupCreationFailed(config, err)
+		_ = m.remove(details.Name, "Failed to create")
+	} else {
+		details.Lock()
+		details.State = state
+		details.Used = time.Now()
+		retryCount := details.RetryCount
+		details.Unlock()
+
+		creationTime := time.Since(started)
+		logger.WithField("duration", creationTime).
+			WithField("now", time.Now()).
+			WithField("retries", retryCount).
+			Infoln("Machine created")
+
+		m.totalActions.WithLabelValues(actionLabels("created", details.targets)...).Inc()
+		m.creationHistogram.WithLabelValues(details.targets.values()...).Observe(creationTime.Seconds())
+
+		// Track it now rather than on the next Acquire.
+		m.heartbeaterFor(config).beat(details.Name, config.Machine.GetHeartbeatInterval())
+
+		// Signal that a new machine is available. When there's contention, there's no guarantee between the
+		// ordering of reading from errCh and the availability check.
+		coordinator.addAvailableMachine()
+	}
+	errCh <- err
+}
+
+func (m *machineProvider) findFreeMachine(skipCache bool, machines ...string) (details *machineDetails) {
+	// Enumerate all machines in reverse order, to always take the newest machines first
+	for idx := range machines {
+		name := machines[len(machines)-idx-1]
+		details := m.machineDetails(name, true)
+		if details == nil {
+			continue
+		}
+
+		ctx, ctxCancelFn := context.WithTimeout(context.Background(), machineCanConnectCommandTimeout)
+		defer ctxCancelFn()
+
+		// Check if node is running
+		canConnect := m.machine.CanConnect(ctx, name, skipCache)
+		if !canConnect {
+			_ = m.remove(name, "machine is unavailable")
+			continue
+		}
+		return details
+	}
+
+	return nil
+}
+
+func (m *machineProvider) findFreeExistingMachine(config *common.RunnerConfig) (*machineDetails, error) {
+	machines, err := m.loadMachines(config)
+	if err != nil {
+		return nil, err
+	}
+
+	return m.findFreeMachine(true, machines...), nil
+}
+
+func (m *machineProvider) useMachine(config *common.RunnerConfig) (*machineDetails, error) {
+	details, err := m.findFreeExistingMachine(config)
+	if err != nil || details != nil {
+		return details, err
+	}
+
+	return m.createAndAcquireMachine(config)
+}
+
+func (m *machineProvider) createAndAcquireMachine(config *common.RunnerConfig) (*machineDetails, error) {
+	coordinator, err := m.runnerMachinesCoordinator(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Idle between creation and tryAcquireMachineDetails below; the shutdown drain must not take it.
+	newDetails, errCh := m.create(config, machineStateIdle, true, m.warmupLimitsFor(config, time.Now()))
+	defer func() {
+		if newDetails != nil {
+			newDetails.Lock()
+			newDetails.pendingUse = false
+			newDetails.Unlock()
+		}
+	}()
+	// Use either a free machine, or the created machine; whichever comes first. There's no guarantee that the created
+	// machine can be used by us because between the time the machine is created, and the acquisition of the machine,
+	// another goroutine may have found it via findFreeMachine and acquired it.
+	var details *machineDetails
+	for details == nil && err == nil {
+		select {
+		case err = <-errCh:
+			if err != nil {
+				return nil, err
+			}
+
+			details = m.tryAcquireMachineDetails(newDetails)
+		case <-coordinator.availableMachineSignal():
+			// Even though the signal is fired and we are *almost* sure that
+			// there's a machine available, let's use the getAvailableMachine
+			// method so that the internal counter is synchonized with what
+			// we are actually doing and so that we can be sure that no other
+			// goroutine that didn't accept the signal and instead used the ticker
+			// hasn't already snatched a machine
+			details, err = m.tryGetFreeExistingMachineFromCoordinator(config, coordinator)
+		case <-time.After(time.Second):
+			details, err = m.tryGetFreeExistingMachineFromCoordinator(config, coordinator)
+		}
+	}
+
+	return details, err
+}
+
+func (m *machineProvider) tryGetFreeExistingMachineFromCoordinator(
+	config *common.RunnerConfig,
+	coordinator *runnerMachinesCoordinator,
+) (*machineDetails, error) {
+	if coordinator.getAvailableMachine() {
+		return m.findFreeExistingMachine(config)
+	}
+
+	return nil, nil
+}
+
+func (m *machineProvider) tryAcquireMachineDetails(details *machineDetails) *machineDetails {
+	details.Lock()
+	defer details.Unlock()
+
+	if details.isUsed() {
+		return nil
+	}
+
+	details.State = machineStateAcquired
+	return details
+}
+
+func (m *machineProvider) retryUseMachine(config *common.RunnerConfig) (details *machineDetails, err error) {
+	// Try to find a machine
+	for range 3 {
+		details, err = m.useMachine(config)
+		if err == nil {
+			break
+		}
+		time.Sleep(provisionRetryInterval)
+	}
+	return
+}
+
+func (m *machineProvider) removeMachine(details *machineDetails) (err error) {
+	details.Lock()
+	logger := details.logger()
+	info := details.info()
+	removeWithoutStop := details.removeWithoutStop
+	details.Unlock()
+
+	ctx, ctxCancelFn := context.WithTimeout(context.Background(), machineExistCommandTimeout)
+	defer ctxCancelFn()
+
+	if !m.machine.Exist(ctx, details.Name) {
+		logger.Warningln("Skipping machine removal, because it doesn't exist")
+		return nil
+	}
+
+	// This code limits amount of removal of stuck machines to one machine per interval
+	if info.isStuckOnRemove() {
+		m.stuckRemoveLock.Lock()
+		defer m.stuckRemoveLock.Unlock()
+	}
+
+	if !removeWithoutStop {
+		logger.Warningln("Stopping machine")
+		stopCtx, stopCtxCancelFn := context.WithTimeout(context.Background(), machineStopCommandTimeout)
+		defer stopCtxCancelFn()
+
+		err = runHistogramCountedOperation(m.stoppingHistogram, func() error {
+			return m.machine.Stop(stopCtx, details.Name)
+		})
+		if err != nil {
+			logger.
+				WithError(err).
+				Warningln("Error while stopping machine")
+		}
+	}
+
+	logger.Warningln("Removing machine")
+	err = runHistogramCountedOperation(m.removalHistogram, func() error {
+		removeCtx, removeCtxCancelFn := context.WithTimeout(context.Background(), machineRemoveCommandTimeout)
+		defer removeCtxCancelFn()
+
+		return m.machine.Remove(removeCtx, details.Name)
+	})
+	if err != nil {
+		details.Lock()
+		details.RetryCount++
+		details.Unlock()
+		time.Sleep(removeRetryInterval)
+		return err
+	}
+
+	return nil
+}
+
+func runHistogramCountedOperation(histogram prometheus.Histogram, operation func() error) error {
+	startedAt := time.Now()
+	err := operation()
+	histogram.Observe(time.Since(startedAt).Seconds())
+
+	return err
+}
+
+func (m *machineProvider) finalizeRemoval(details *machineDetails) {
+	max := details.maxRemovalAttempts
+	if max <= 0 {
+		max = defaultMaxRemovalAttempts
+	}
+
+	var (
+		lastErr  error
+		attempts int
+	)
+	for attempts = 1; attempts <= max; attempts++ {
+		lastErr = m.removeMachine(details)
+		if lastErr == nil {
+			break
+		}
+	}
+	gaveUp := lastErr != nil
+	if gaveUp {
+		details.logger().
+			WithError(lastErr).
+			WithField("attempts", attempts-1).
+			Warningln("Giving up on machine removal. The remote VM may be orphaned.")
+
+		// docker-machine rm -y leaves the local store on disk when Driver.Remove
+		// returns an error. Without rm -f the JSON under ~/.docker/machine/machines/
+		// accumulates across give-ups and drifts away from GCP state.
+		forceCtx, forceCancel := context.WithTimeout(context.Background(), machineRemoveCommandTimeout)
+		defer forceCancel()
+		if err := m.machine.ForceRemove(forceCtx, details.Name); err != nil {
+			details.logger().WithError(err).Warningln("ForceRemove on give-up failed")
+		}
+
+		// Set before the entry is dropped so a concurrent drain sees the
+		// give-up instead of the cleared map.
+		details.Lock()
+		details.removalGaveUp = true
+		details.Unlock()
+	}
+
+	m.forgetHeartbeat(details.Name)
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	delete(m.details, details.Name)
+
+	details.Lock()
+	retryCount := details.RetryCount
+	details.Unlock()
+
+	logEntry := details.logger().
+		WithField("now", time.Now()).
+		WithField("retries", retryCount)
+	if gaveUp {
+		logEntry.Warningln("Machine state cleared after give-up")
+	} else {
+		logEntry.Infoln("Machine removed")
+	}
+
+	m.totalActions.WithLabelValues(actionLabels("removed", details.targets)...).Inc()
+}
+
+func (m *machineProvider) remove(machineName string, reason ...any) error {
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	details := m.details[machineName]
+	if details == nil {
+		return errors.New("machine not found")
+	}
+
+	now := time.Now()
+	done := make(chan struct{})
+
+	details.Lock()
+	details.Reason = fmt.Sprint(reason...)
+	details.State = machineStateRemoving
+	details.RetryCount = 0
+	details.inFlight = done
+
+	details.logger().
+		WithField("now", now).
+		Warningln("Requesting machine removal")
+
+	details.Used = now
+	details.writeDebugInformation()
+	details.Unlock()
+
+	go func() {
+		defer close(done)
+		m.finalizeRemoval(details)
+	}()
+	return nil
+}
+
+func (m *machineProvider) updateMachines(
+	machines []string,
+	config *common.RunnerConfig,
+	warmup *warmupLimits,
+) (data machinesData, validMachines []string) {
+	data.Runner = config.ShortDescription()
+	validMachines = make([]string, 0, len(machines))
+	heartbeats := m.heartbeaterFor(config)
+
+	for _, name := range machines {
+		details := m.machineDetails(name, false)
+
+		details.Lock()
+		details.LastSeen = time.Now()
+		details.missedListings = 0
+		details.removeWithoutStop = config.Machine.RemoveWithoutStop
+		info := details.info()
+		details.Unlock()
+
+		reason := shouldRemoveIdle(config, &data, warmup, info)
+		if reason == dontRemoveIdleMachine {
+			validMachines = append(validMachines, name)
+			if info.State != machineStateCreating && info.State != machineStateRemoving {
+				heartbeats.beat(name, config.Machine.GetHeartbeatInterval())
+			}
+		} else {
+			_ = m.remove(details.Name, reason)
+		}
+
+		// remove() above can mutate details, so we re-create info:
+		details.Lock()
+		info = details.info()
+		details.Unlock()
+
+		data.Add(info)
+	}
+	return data, validMachines
+}
+
+func (m *machineProvider) pruneVanished(listed []string, config *common.RunnerConfig) {
+	listedSet := make(map[string]struct{}, len(listed))
+	for _, name := range listed {
+		listedSet[name] = struct{}{}
+	}
+	filter := machineFilter(config)
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	for name, details := range m.details {
+		if _, ok := listedSet[name]; ok || !details.match(filter) {
+			continue
+		}
+
+		details.Lock()
+		if details.State != machineStateIdle {
+			details.Unlock()
+			continue
+		}
+		details.missedListings++
+		misses := details.missedListings
+		lastSeen := details.LastSeen
+		targets := details.targets
+		logger := details.logger()
+		details.Unlock()
+
+		if misses < vanishedAfterMisses {
+			continue
+		}
+
+		delete(m.details, name)
+		logger.
+			WithField("misses", misses).
+			WithField("lastListed", time.Since(lastSeen)).
+			Warningln("Machine vanished from the docker-machine store, dropping it")
+		m.totalActions.WithLabelValues(actionLabels("vanished", targets)...).Inc()
+	}
+}
+
+// createMachines starts goroutines that are creating the new machines.
+// Limiting strategy is used to ensure the autoscaling parameters are respected.
+// heartbeaterFor returns this runner config's heartbeater, building it
+// on first use. State is per config so one runner's prune cannot touch
+// another runner's machines. The semaphore bounding concurrent label
+// writes is shared across the provider, sized from the global
+// [machine.heartbeat] section.
+func (m *machineProvider) heartbeaterFor(config *common.RunnerConfig) *heartbeater {
+	m.heartbeatersLock.Lock()
+	defer m.heartbeatersLock.Unlock()
+
+	if m.heartbeatSem == nil {
+		m.heartbeatSem = make(chan struct{}, config.GlobalMachineConfig.GetHeartbeatConcurrency())
+	}
+
+	token := config.GetToken()
+	h, ok := m.heartbeaters[token]
+	if !ok {
+		h = newHeartbeater(
+			func(ctx context.Context, name string, value string) error {
+				return m.machine.UpdateLabels(ctx, name, map[string]string{heartbeatLabel: value})
+			},
+			m.heartbeatSem,
+		)
+		if m.heartbeaters == nil {
+			m.heartbeaters = map[string]*heartbeater{}
+		}
+		m.heartbeaters[token] = h
+	}
+
+	return h
+}
+
+// forgetHeartbeat stops refreshing a machine the manager no longer tracks,
+// whether removal succeeded or gave up on a VM that is still there.
+func (m *machineProvider) forgetHeartbeat(name string) {
+	m.heartbeatersLock.Lock()
+	defer m.heartbeatersLock.Unlock()
+
+	for _, h := range m.heartbeaters {
+		h.forget(name)
+	}
+}
+
+func (m *machineProvider) createMachines(config *common.RunnerConfig, data *machinesData, warmup *warmupLimits) {
+	for {
+		if !canCreateIdle(config, data, warmup) || m.shuttingDown.Load() {
+			return
+		}
+
+		// Create a new machine and mark it as Idle
+		m.create(config, machineStateIdle, false, warmup)
+		data.Creating++
+	}
+}
+
+// intermediateMachineList returns a list of machines that might not yet be
+// persisted on disk, these machines are the ones between being virtually
+// created, and `docker-machine create` getting executed we populate this data
+// set to overcome the race conditions related to not-full set of machines
+// returned by `docker-machine ls -q`
+func (m *machineProvider) intermediateMachineList(excludedMachines []string) []string {
+	var excludedSet map[string]struct{}
+	var intermediateMachines []string
+
+	m.lock.Lock()
+	defer m.lock.Unlock()
+
+	for _, details := range m.details {
+		details.Lock()
+		persisted := details.isPersistedOnDisk()
+		details.Unlock()
+
+		if persisted {
+			continue
+		}
+
+		// lazy init set, as most of times we don't create new machines
+		if excludedSet == nil {
+			excludedSet = make(map[string]struct{}, len(excludedMachines))
+			for _, excludedMachine := range excludedMachines {
+				excludedSet[excludedMachine] = struct{}{}
+			}
+		}
+
+		if _, ok := excludedSet[details.Name]; ok {
+			continue
+		}
+
+		intermediateMachines = append(intermediateMachines, details.Name)
+	}
+
+	return intermediateMachines
+}
+
+func (m *machineProvider) loadMachines(config *common.RunnerConfig) (machines []string, err error) {
+	machines, err = m.machine.List()
+	if err != nil {
+		return nil, err
+	}
+
+	machines = append(machines, m.intermediateMachineList(machines)...)
+	machines = filterMachineList(machines, machineFilter(config))
+	return
+}
+
+func (m *machineProvider) Acquire(config *common.RunnerConfig) (common.ExecutorData, error) {
+	if config.Machine == nil || config.Machine.MachineName == "" {
+		return nil, fmt.Errorf("missing Machine options")
+	}
+
+	if m.shuttingDown.Load() {
+		return nil, &common.NoFreeExecutorError{Message: "executor provider is shutting down"}
+	}
+
+	// Lock updating machines, because two Acquires can be run at the same time
+	m.acquireLock.Lock()
+	defer m.acquireLock.Unlock()
+
+	// Before loadMachines, so a failing `docker-machine ls` still starts the
+	// clock and /health/ready is not 503 for longer than WarmupDuration.
+	now := time.Now()
+	warmup := m.warmupAcquire(config, now)
+
+	machines, err := m.loadMachines(config)
+	if err != nil {
+		return nil, err
+	}
+
+	// Update a list of currently configured machines
+	machinesData, validMachines := m.updateMachines(machines, config, warmup)
+	m.pruneVanished(machines, config)
+	m.heartbeaterFor(config).prune(machines)
+
+	// Pre-create machines
+	m.createMachines(config, &machinesData, warmup)
+
+	m.observeWarmup(config, &machinesData, now)
+	m.updateAutoscalingLimits(config, &machinesData, warmup)
+
+	logger := logrus.WithFields(machinesData.Fields()).
+		WithField("runner", config.ShortDescription()).
+		WithField("idleCountMin", config.Machine.GetIdleCountMin()).
+		WithField("idleCount", config.Machine.GetIdleCount()).
+		WithField("idleScaleFactor", config.Machine.GetIdleScaleFactor()).
+		WithField("maxMachines", config.Limit).
+		WithField("maxMachineCreate", config.Machine.MaxGrowthRate)
+
+	logger.WithField("time", time.Now()).Debugln("Docker Machine Details")
+	machinesData.writeDebugInformation()
+
+	// Try to find a free machine
+	details := m.findFreeMachine(false, validMachines...)
+	if details != nil {
+		return details, nil
+	}
+
+	if config.Machine.GetIdleCount() == 0 && canCreateOnDemand(config, &machinesData, warmup) {
+		logger.Debug("IdleCount is set to 0 so the machine will be created on demand in job context")
+	} else if machinesData.Idle == 0 {
+		return nil, &common.NoFreeExecutorError{Message: "no free machines that can process builds"}
+	}
+
+	return nil, nil
+}
+
+//nolint:nakedret
+func (m *machineProvider) Use(
+	config *common.RunnerConfig,
+	data common.ExecutorData,
+) (newConfig common.RunnerConfig, newData common.ExecutorData, err error) {
+	// Find a new machine
+	details, _ := data.(*machineDetails)
+
+	canBeUsed := false
+	if details != nil {
+		details.Lock()
+		canBeUsed = details.canBeUsed()
+		details.Unlock()
+	}
+
+	ctx, ctxCancelFn := context.WithTimeout(context.Background(), machineCanConnectCommandTimeout)
+	defer ctxCancelFn()
+
+	if !canBeUsed || !m.machine.CanConnect(ctx, details.Name, true) {
+		details, err = m.retryUseMachine(config)
+		if err != nil {
+			return
+		}
+
+		// Return details only if this is a new instance
+		newData = details
+	}
+
+	credCtx, credCtxCancelFn := context.WithTimeout(context.Background(), machineCredentialsCommandTimeout)
+	defer credCtxCancelFn()
+
+	// Get machine credentials
+	dc, err := m.machine.Credentials(credCtx, details.Name)
+	if err != nil {
+		if newData != nil {
+			m.Release(config, newData)
+		}
+		newData = nil
+		return
+	}
+
+	// Create shallow copy of config and store in it docker credentials
+	newConfig = *config
+	newConfig.Docker = &common.DockerConfig{}
+	if config.Docker != nil {
+		*newConfig.Docker = *config.Docker
+	}
+	newConfig.Docker.Credentials = dc
+
+	// Mark machine as used
+	details.Lock()
+	details.State = machineStateUsed
+	details.Used = time.Now()
+	details.UsedCount++
+	details.Unlock()
+
+	m.totalActions.WithLabelValues(actionLabels("used", details.targets)...).Inc()
+	return
+}
+
+func (m *machineProvider) Release(config *common.RunnerConfig, data common.ExecutorData) {
+	// Release machine
+	details, ok := data.(*machineDetails)
+	if !ok {
+		return
+	}
+
+	details.Lock()
+	// Mark last used time when is Used
+	if details.State == machineStateUsed {
+		details.Used = time.Now()
+	}
+	usedCount := details.UsedCount
+	details.Unlock()
+
+	// Remove machine if we already used it
+	if config != nil && config.Machine != nil &&
+		config.Machine.MaxBuilds > 0 && usedCount >= config.Machine.MaxBuilds {
+		err := m.remove(details.Name, "Too many builds")
+		if err == nil {
+			return
+		}
+	}
+	details.Lock()
+	details.State = machineStateIdle
+	details.Unlock()
+
+	// Signal pending builds that a new machine is available.
+	if err := m.signalRelease(config); err != nil {
+		return
+	}
+}
+
+func (m *machineProvider) updateAutoscalingLimits(config *common.RunnerConfig, data *machinesData, warmup *warmupLimits) {
+	m.autoscalingLimitsLock.Lock()
+	defer m.autoscalingLimitsLock.Unlock()
+
+	m.autoscalingLimits[config.ShortDescription()] = autoscalingLimits{
+		runnerName:    config.Name,
+		systemID:      config.GetSystemID(),
+		maxGrowthRate: float64(maxGrowthRate(config, warmup)),
+		idleTarget:    float64(effectiveIdleTarget(config, data, warmup)),
+		warmupEnabled: config.Machine.WarmupEnabled(),
+		updatedAt:     time.Now(),
+	}
+}
+
+func (m *machineProvider) signalRelease(config *common.RunnerConfig) error {
+	coordinator, err := m.runnerMachinesCoordinator(config)
+	if err != nil && err != errNoConfig {
+		return err
+	}
+
+	if err != errNoConfig && coordinator != nil {
+		coordinator.addAvailableMachine()
+	}
+
+	return nil
+}
+
+func (m *machineProvider) CanCreate() bool {
+	return m.provider.CanCreate()
+}
+
+func (m *machineProvider) GetFeatures(features *common.FeaturesInfo) error {
+	return m.provider.GetFeatures(features)
+}
+
+func (m *machineProvider) GetConfigInfo(input *common.RunnerConfig, output *common.ConfigInfo) {
+	m.provider.GetConfigInfo(input, output)
+}
+
+func (m *machineProvider) GetDefaultShell() string {
+	return m.provider.GetDefaultShell()
+}
+
+func (m *machineProvider) Create() common.Executor {
+	return &machineExecutor{
+		provider: m,
+	}
+}
+
+func newMachineProvider(provider common.ExecutorProvider) *machineProvider {
+	name := "docker+machine"
+
+	return &machineProvider{
+		name:              name,
+		details:           make(machinesDetails),
+		runners:           make(runnersDetails),
+		machine:           docker.NewMachineCommand(),
+		provider:          provider,
+		machineMetrics:    newMachineMetrics(name, nil),
+		autoscalingLimits: make(map[string]autoscalingLimits),
+		warmups:           make(map[string]*warmupState),
+		startedAt:         time.Now(),
+	}
+}

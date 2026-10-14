@@ -1,0 +1,276 @@
+//go:build !integration
+
+package shell
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+
+	"gitlab.com/gitlab-org/gitlab-runner/common"
+	"gitlab.com/gitlab-org/gitlab-runner/common/spec"
+	"gitlab.com/gitlab-org/gitlab-runner/executors"
+	"gitlab.com/gitlab-org/gitlab-runner/helpers/process"
+	"gitlab.com/gitlab-org/gitlab-runner/shells/shellstest"
+)
+
+func TestExecutor_Run(t *testing.T) {
+	var testErr = errors.New("test error")
+	var exitErr = &exec.ExitError{}
+
+	tests := map[string]struct {
+		commanderAssertions     func(*process.MockCommander, chan struct{})
+		processKillerAssertions func(*process.MockKillWaiter, chan struct{})
+		cancelJob               bool
+		expectedErr             error
+	}{
+		"canceled job uses new process termination": {
+			commanderAssertions: func(mCmd *process.MockCommander, killCalled chan struct{}) {
+				mCmd.On("Start").Return(nil).Once()
+				// Like a real process, Wait only returns once it has been
+				// killed. If it returned straight away, the result would be
+				// on waitCh by the time Run selects on it and, with the
+				// context already cancelled, select would pick either case
+				// at random, sometimes skipping KillAndWait.
+				mCmd.On("Wait").Run(func(args mock.Arguments) {
+					<-killCalled
+				}).Return(nil).Once()
+			},
+			processKillerAssertions: func(mProcessKillWaiter *process.MockKillWaiter, killCalled chan struct{}) {
+				mProcessKillWaiter.
+					On("KillAndWait", mock.Anything, mock.Anything).
+					Run(func(args mock.Arguments) {
+						close(killCalled)
+						// Drain waitCh like the real KillAndWait, so Wait
+						// has been called before Run returns.
+						<-args.Get(1).(chan error)
+					}).
+					Return(nil).
+					Once()
+			},
+			cancelJob:   true,
+			expectedErr: nil,
+		},
+		"cmd fails to start": {
+			commanderAssertions: func(mCmd *process.MockCommander, _ chan struct{}) {
+				mCmd.On("Start").Return(testErr).Once()
+			},
+			processKillerAssertions: func(_ *process.MockKillWaiter, _ chan struct{}) {},
+			expectedErr:             testErr,
+		},
+		"wait returns error": {
+			commanderAssertions: func(mCmd *process.MockCommander, _ chan struct{}) {
+				mCmd.On("Start").Return(nil).Once()
+				mCmd.On("Wait").Return(testErr).Once()
+			},
+			processKillerAssertions: func(_ *process.MockKillWaiter, _ chan struct{}) {},
+			cancelJob:               false,
+			expectedErr:             testErr,
+		},
+		"wait returns exit error": {
+			commanderAssertions: func(mCmd *process.MockCommander, _ chan struct{}) {
+				mCmd.On("Start").Return(nil).Once()
+				mCmd.On("Wait").Return(exitErr).Once()
+			},
+			processKillerAssertions: func(_ *process.MockKillWaiter, _ chan struct{}) {},
+			cancelJob:               false,
+			expectedErr:             &common.BuildError{FailureReason: common.ScriptFailure},
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+				mProcessKillWaiter, mCmd, cleanup := setupProcessMocks(t)
+				defer cleanup()
+
+				killCalled := make(chan struct{})
+				tt.commanderAssertions(mCmd, killCalled)
+				tt.processKillerAssertions(mProcessKillWaiter, killCalled)
+
+				executor := executor{
+					AbstractExecutor: executors.AbstractExecutor{
+						Build: &common.Build{
+							Job:    spec.Job{},
+							Runner: &common.RunnerConfig{},
+						},
+						BuildShell: &common.ShellConfiguration{
+							Command: shell,
+						},
+					},
+				}
+
+				ctx, cancelJob := context.WithCancel(t.Context())
+				defer cancelJob()
+
+				cmd := common.ExecutorCommand{
+					Script:     "echo hello",
+					Predefined: false,
+					Context:    ctx,
+				}
+
+				if tt.cancelJob {
+					cancelJob()
+				}
+
+				err := executor.Run(cmd)
+				assert.ErrorIs(t, err, tt.expectedErr)
+			})
+		})
+	}
+}
+
+func setupProcessMocks(t *testing.T) (*process.MockKillWaiter, *process.MockCommander, func()) {
+	mProcessKillWaiter := process.NewMockKillWaiter(t)
+	mCmd := process.NewMockCommander(t)
+
+	oldNewProcessKillWaiter := newProcessKillWaiter
+	oldCmd := newCommander
+
+	newProcessKillWaiter = func(
+		logger process.Logger,
+		gracefulKillTimeout time.Duration,
+		forceKillTimeout time.Duration,
+	) process.KillWaiter {
+		return mProcessKillWaiter
+	}
+
+	newCommander = func(executable string, args []string, options process.CommandOptions) process.Commander {
+		return mCmd
+	}
+
+	return mProcessKillWaiter, mCmd, func() {
+		newProcessKillWaiter = oldNewProcessKillWaiter
+		newCommander = oldCmd
+	}
+}
+
+func TestExecutor_Run_ExitCodeWiring(t *testing.T) {
+	exitErr := &exec.ExitError{}
+
+	shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+		mProcessKillWaiter, mCmd, cleanup := setupProcessMocks(t)
+		defer cleanup()
+		_ = mProcessKillWaiter
+
+		mCmd.On("Start").Return(nil).Once()
+		mCmd.On("Wait").Return(exitErr).Once()
+
+		executor := executor{
+			AbstractExecutor: executors.AbstractExecutor{
+				Build: &common.Build{
+					Job:    spec.Job{},
+					Runner: &common.RunnerConfig{},
+				},
+				BuildShell: &common.ShellConfiguration{
+					Command: shell,
+				},
+			},
+		}
+
+		cmd := common.ExecutorCommand{
+			Script:     "echo hello",
+			Predefined: false,
+			Context:    t.Context(),
+		}
+
+		err := executor.Run(cmd)
+
+		var buildErr *common.BuildError
+		require.ErrorAs(t, err, &buildErr)
+		assert.Equal(t, -1, buildErr.ExitCode,
+			"ExitCode must be the normalized exit code")
+		assert.Equal(t, exitErr, buildErr.Inner,
+			"Inner must be the original error, preserving messages like 'signal: killed'")
+	})
+}
+
+func TestExitCodeNormalization_WindowsDWORD(t *testing.T) {
+	const windowsDWORD = 4294967295 // "exit -1" on Windows stored as uint32 0xFFFFFFFF
+
+	buildErr := &common.BuildError{
+		Inner:    fmt.Errorf("exit status %d", windowsDWORD),
+		ExitCode: common.NormalizeExitCode(windowsDWORD),
+	}
+
+	assert.Equal(t, -1, buildErr.ExitCode)
+	assert.Equal(t, "exit status 4294967295", buildErr.Inner.Error())
+}
+
+func TestExecutor_Prepare_MakesPathsAbsolute(t *testing.T) {
+	tests := map[string]struct {
+		defaultBuildsDir string
+		defaultCacheDir  string
+	}{
+		"relative paths": {
+			defaultBuildsDir: "builds",
+			defaultCacheDir:  "cache",
+		},
+		"paths with $PWD": {
+			defaultBuildsDir: "$PWD/builds",
+			defaultCacheDir:  "$PWD/cache",
+		},
+		"already absolute paths": {
+			defaultBuildsDir: "/tmp/builds",
+			defaultCacheDir:  "/tmp/cache",
+		},
+	}
+
+	for name, tt := range tests {
+		t.Run(name, func(t *testing.T) {
+			wd, err := os.Getwd()
+			require.NoError(t, err)
+
+			shellstest.OnEachShell(t, func(t *testing.T, shell string) {
+				e := &executor{
+					AbstractExecutor: executors.AbstractExecutor{
+						ExecutorOptions: executors.ExecutorOptions{
+							DefaultBuildsDir: tt.defaultBuildsDir,
+							DefaultCacheDir:  tt.defaultCacheDir,
+							Shell: common.ShellScriptInfo{
+								Shell: shell,
+							},
+						},
+					},
+				}
+
+				// Create a minimal build for Prepare to work
+				build := &common.Build{
+					Job: spec.Job{
+						Variables: spec.Variables{},
+					},
+					Runner: &common.RunnerConfig{},
+				}
+
+				// Call Prepare which should make paths absolute
+				err = e.Prepare(common.ExecutorPrepareOptions{
+					Config:  &common.RunnerConfig{},
+					Build:   build,
+					Context: t.Context(),
+				})
+				require.NoError(t, err)
+
+				// Verify that both paths are now absolute
+				assert.True(t, filepath.IsAbs(e.DefaultBuildsDir), "DefaultBuildsDir should be absolute, got: %s", e.DefaultBuildsDir)
+				assert.True(t, filepath.IsAbs(e.DefaultCacheDir), "DefaultCacheDir should be absolute, got: %s", e.DefaultCacheDir)
+
+				// Verify that relative paths are resolved relative to current working directory
+				if tt.defaultBuildsDir == "builds" {
+					assert.Equal(t, filepath.Join(wd, "builds"), e.DefaultBuildsDir)
+				}
+				if tt.defaultCacheDir == "cache" {
+					assert.Equal(t, filepath.Join(wd, "cache"), e.DefaultCacheDir)
+				}
+			})
+		})
+	}
+}

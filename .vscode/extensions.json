@@ -1,0 +1,11 @@
+{
+  "recommendations": [
+    "golang.go",
+    "766b.go-outliner",
+    "bungcip.better-toml",
+    "davidanson.vscode-markdownlint",
+    "romanpeshkov.go-test-outline",
+    "errata-ai.vale-server",
+    "timonwong.shellcheck",
+  ]
+}

@@ -1,0 +1,302 @@
+.trigger-downstream-pipeline-ref:
+  stage: postrelease
+  variables:
+    UPSTREAM_CI_COMMIT_REF: $CI_COMMIT_BRANCH
+    UPSTREAM_CI_COMMIT_SHORT_SHA: $CI_COMMIT_SHORT_SHA
+    UPSTREAM_RUNNER_IMAGE_REPO: $CI_REGISTRY_IMAGE
+    UPSTREAM_RUNNER_HELPER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-helper
+  rules:
+    # copy of .rules:merge_request_pipelines:no_docs:only_canonical, slightly modified for variables
+    - if: '$CI_PROJECT_NAMESPACE !~ /^gitlab-org($|\/)/'
+      when: never
+    - if: $CI_PROJECT_PATH != "gitlab-org/gitlab-runner"
+      when: never
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merge_train"
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: "refs/merge-requests/${CI_MERGE_REQUEST_IID}/train"
+        UPSTREAM_RUNNER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-dev
+        UPSTREAM_RUNNER_HELPER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-helper-dev
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "detached"
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: "refs/merge-requests/${CI_MERGE_REQUEST_IID}/head"
+        UPSTREAM_RUNNER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-dev
+        UPSTREAM_RUNNER_HELPER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-helper-dev
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "merged_result"
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: "refs/merge-requests/${CI_MERGE_REQUEST_IID}/merge"
+        UPSTREAM_RUNNER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-dev
+        UPSTREAM_RUNNER_HELPER_IMAGE_REPO: $CI_REGISTRY_IMAGE/gitlab-runner-helper-dev
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: $CI_COMMIT_REF_NAME
+    - if: $CI_COMMIT_REF_NAME =~ /\Av[0-9]+\.[0-9]+\.[0-9]+?\z/
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: $CI_COMMIT_REF_NAME
+    - if: $CI_COMMIT_REF_NAME =~ /\Av[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?\z/
+      changes: !reference [.code-backstage-patterns]
+      variables:
+        UPSTREAM_CI_COMMIT_REF: $CI_COMMIT_REF_NAME
+
+trigger UBI images build:
+  extends:
+    - .trigger-downstream-pipeline-ref
+  needs:
+    - job: "development S3"
+      optional: true
+    - job: "bleeding edge S3"
+      optional: true
+    - job: "stable S3"
+      optional: true
+  variables:
+    BUILD_RELEASE: $CI_COMMIT_REF_NAME
+    BUILD_RELEASE_SHA: $CI_COMMIT_SHORT_SHA
+  trigger:
+    strategy: depend
+    project: gitlab-org/ci-cd/gitlab-runner-ubi-images
+
+trigger runner-incept tests:
+  extends:
+    - .trigger-downstream-pipeline-ref
+    # make sure the needs jobs here match the ones in the downstream pipeline, or jobs in the downstream pipeline will
+    # fail with: "This job could not start because it could not retrieve the needed artifacts."
+  needs:
+    - binaries
+    - "helper images"
+    - "prebuilt helper images"
+    - job: "development docker images"
+      optional: true
+    - job: "bleeding edge docker images"
+      optional: true
+    - job: "stable docker images"
+      optional: true
+  trigger:
+    project: gitlab-org/ci-cd/tests/runner-incept
+    # strategy: depend
+
+package test variables:
+  extends:
+    - .trigger-downstream-pipeline-ref
+    - .rules:release:bleeding-edge
+    - .kubernetes runner
+  needs:
+    - "unstable pulp"
+  image: alpine:latest
+  artifacts:
+    paths:
+      - package_test_vars.env
+  before_script:
+    - apk add git bash
+  script:
+    - rm -f package_test_vars.env
+    - echo "export RUNNER_FROM_VERSION=\"$(git tag | sort -rV | sed "1q;d" | cut -c2-)\"" >> package_test_vars.env
+    - echo "export RUNNER_FROM_BRANCH=\"gitlab-runner\"" >> package_test_vars.env
+    - echo "export RUNNER_TO_VERSION=\"$(ci/version)\"" >> package_test_vars.env
+    - echo "export RUNNER_TO_BRANCH=\"unstable\"" >> package_test_vars.env
+
+trigger runner package tests:
+  extends:
+    - .trigger-downstream-pipeline-ref
+    - .rules:release:bleeding-edge
+  needs:
+    - "package test variables"
+  trigger:
+    # strategy: depend
+    project: gitlab-org/ci-cd/runner-tools/gitlab-runner-package-tests
+
+.verify-resources:
+  extends:
+    - .rules:merge_request_pipelines:no_docs
+    - .docker
+  stage: postrelease
+  script:
+    - mage resources:verifyAll
+
+verify development resources:
+  extends:
+    - .verify-resources
+    - .rules:release:development:merge-requests
+  needs:
+    - job: "development docker images"
+      artifacts: true
+
+verify bleeding edge resources:
+  extends:
+    - .verify-resources
+    - .rules:release:bleeding-edge
+  environment:
+    name: bleeding_edge/docker_images/linux
+    url: https://hub.docker.com/r/gitlab/gitlab-runner/tags/
+  needs:
+    - job: "bleeding edge docker images"
+      artifacts: true
+
+verify stable resources:
+  extends:
+    - .verify-resources
+    - .rules:release:stable:branch
+  environment:
+    name: stable/docker_images/linux
+    url: https://hub.docker.com/r/gitlab/gitlab-runner/tags/
+  needs:
+    - job: "stable docker images"
+      artifacts: true
+
+stable gitlab release:
+  stage: postrelease
+  extends:
+    - .rules:release:stable-or-rc
+    - .kubernetes runner
+  dependencies: []
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  variables:
+    CHANGELOG: https://gitlab.com/gitlab-org/gitlab-runner/blob/$CI_COMMIT_TAG/CHANGELOG.md
+    S3: https://gitlab-runner-downloads.s3.amazonaws.com/$CI_COMMIT_TAG
+    # Setting the CI_PROJECT_ID variable explicitly because we're running this job
+    # also from the https://gitlab.com/gitlab-org/security/gitlab-runner fork. But it
+    # should still create the release entry in the canonical one.
+    CI_PROJECT_ID: 250833
+  environment:
+    name: stable/gitlab
+    url: https://gitlab.com/gitlab-org/gitlab-runner/-/releases
+  before_script: []
+  script:
+    - echo "Releasing to $S3"
+  release:
+    name: "$CI_COMMIT_TAG"
+    description: |
+      See [the changelog]($CHANGELOG) :rocket:
+
+      GitLab Runner documentation can be found at https://docs.gitlab.com/runner/.
+    tag_name: "$CI_COMMIT_TAG"
+    ref: "$CI_COMMIT_TAG"
+    assets:
+      links:
+        # binaries
+        - name: "binary: Linux amd64"
+          url: "$S3/binaries/gitlab-runner-linux-amd64"
+          filepath: "/binaries/gitlab-runner-linux-amd64"
+        - name: "binary: Linux amd64-fips"
+          url: "$S3/binaries/gitlab-runner-linux-amd64-fips"
+          filepath: "/binaries/gitlab-runner-linux-amd64-fips"
+        - name: "binary: Linux 386"
+          url: "$S3/binaries/gitlab-runner-linux-386"
+          filepath: "/binaries/gitlab-runner-linux-386"
+        - name: "binary: Linux arm"
+          url: "$S3/binaries/gitlab-runner-linux-arm"
+          filepath: "/binaries/gitlab-runner-linux-arm"
+        - name: "binary: Linux ppc64el"
+          url: "$S3/binaries/gitlab-runner-linux-ppc64el"
+          filepath: "/binaries/gitlab-runner-linux-ppc64el"
+        - name: "binary: Linux s390x"
+          url: "$S3/binaries/gitlab-runner-linux-s390x"
+          filepath: "/binaries/gitlab-runner-linux-s390x"
+        - name: "binary: Linux riscv64"
+          url: "$S3/binaries/gitlab-runner-linux-riscv64"
+          filepath: "/binaries/gitlab-runner-linux-riscv64"
+        - name: "binary: Linux loong64"
+          url: "$S3/binaries/gitlab-runner-linux-loong64"
+          filepath: "/binaries/gitlab-runner-linux-loong64"
+
+        - name: "binary: macOS amd64"
+          url: "$S3/binaries/gitlab-runner-darwin-amd64"
+          filepath: "/binaries/gitlab-runner-darwin-amd64"
+        - name: "binary: macOS arm64"
+          url: "$S3/binaries/gitlab-runner-darwin-arm64"
+          filepath: "/binaries/gitlab-runner-darwin-arm64"
+
+        - name: "binary: FreeBSD amd64"
+          url: "$S3/binaries/gitlab-runner-freebsd-amd64"
+          filepath: "/binaries/gitlab-runner-freebsd-amd64"
+        - name: "binary: FreeBSD arm"
+          url: "$S3/binaries/gitlab-runner-freebsd-arm"
+          filepath: "/binaries/gitlab-runner-freebsd-arm"
+        - name: "binary: FreeBSD 386"
+          url: "$S3/binaries/gitlab-runner-freebsd-386"
+          filepath: "/binaries/gitlab-runner-freebsd-386"
+
+        - name: "binary: Windows amd64"
+          url: "$S3/binaries/gitlab-runner-windows-amd64.zip"
+          filepath: "/binaries/gitlab-runner-windows-amd64.zip"
+        - name: "binary: Windows arm64"
+          url: "$S3/binaries/gitlab-runner-windows-arm64.zip"
+          filepath: "/binaries/gitlab-runner-windows-arm64.zip"
+        - name: "binary: Windows i386"
+          url: "$S3/binaries/gitlab-runner-windows-386.zip"
+          filepath: "/binaries/gitlab-runner-windows-386.zip"
+
+        # DEB packages
+        - name: "package: DEB amd64"
+          url: "$S3/deb/gitlab-runner_amd64.deb"
+          filepath: "/packages/deb/gitlab-runner_amd64.deb"
+        - name: "package: DEB i386"
+          url: "$S3/deb/gitlab-runner_i386.deb"
+          filepath: "/packages/deb/gitlab-runner_i386.deb"
+        - name: "package: DEB armhf"
+          url: "$S3/deb/gitlab-runner_armhf.deb"
+          filepath: "/packages/deb/gitlab-runner_armhf.deb"
+        - name: "package: DEB arm64"
+          url: "$S3/deb/gitlab-runner_arm64.deb"
+          filepath: "/packages/deb/gitlab-runner_arm64.deb"
+        - name: "package: DEB ppc64el"
+          url: "$S3/deb/gitlab-runner_ppc64el.deb"
+          filepath: "/packages/deb/gitlab-runner_ppc64el.deb"
+        - name: "package: DEB s390x"
+          url: "$S3/deb/gitlab-runner_s390x.deb"
+          filepath: "/packages/deb/gitlab-runner_s390x.deb"
+        - name: "package: DEB riscv64"
+          url: "$S3/deb/gitlab-runner_riscv64.deb"
+          filepath: "/packages/deb/gitlab-runner_riscv64.deb"
+        - name: "package: DEB loong64"
+          url: "$S3/deb/gitlab-runner_loong64.deb"
+          filepath: "/packages/deb/gitlab-runner_loong64.deb"
+        - name: "package: DEB helper images"
+          url: "$S3/deb/gitlab-runner-helper-images.deb"
+          filepath: "/packages/deb/gitlab-runner-helper-images.deb"
+
+        # RPM packages
+        - name: "package: RPM x86_64"
+          url: "$S3/rpm/gitlab-runner_x86_64.rpm"
+          filepath: "/packages/rpm/gitlab-runner_x86_64.rpm"
+        - name: "package: RPM x86_64-fips"
+          url: "$S3/rpm/gitlab-runner_x86_64-fips.rpm"
+          filepath: "/packages/rpm/gitlab-runner_x86_64-fips.rpm"
+        - name: "package: RPM i686"
+          url: "$S3/rpm/gitlab-runner_i686.rpm"
+          filepath: "/packages/rpm/gitlab-runner_i686.rpm"
+        - name: "package: RPM armhfp"
+          url: "$S3/rpm/gitlab-runner_armhfp.rpm"
+          filepath: "/packages/rpm/gitlab-runner_armhfp.rpm"
+        - name: "package: RPM aarch64"
+          url: "$S3/rpm/gitlab-runner_aarch64.rpm"
+          filepath: "/packages/rpm/gitlab-runner_aarch64.rpm"
+        - name: "package: RPM ppc64le"
+          url: "$S3/rpm/gitlab-runner_ppc64le.rpm"
+          filepath: "/packages/rpm/gitlab-runner_ppc64le.rpm"
+        - name: "package: RPM s390x"
+          url: "$S3/rpm/gitlab-runner_s390x.rpm"
+          filepath: "/packages/rpm/gitlab-runner_s390x.rpm"
+        - name: "package: RPM riscv64"
+          url: "$S3/rpm/gitlab-runner_riscv64.rpm"
+          filepath: "/packages/rpm/gitlab-runner_riscv64.rpm"
+        - name: "package: RPM loongarch64"
+          url: "$S3/rpm/gitlab-runner_loongarch64.rpm"
+          filepath: "/packages/rpm/gitlab-runner_loongarch64.rpm"
+        - name: "package: RPM helper images"
+          url: "$S3/rpm/gitlab-runner-helper-images.rpm"
+          filepath: "/packages/rpm/gitlab-runner-helper-images.rpm"
+
+        # Other files
+        - name: "checksums"
+          url: "$S3/release.sha256"
+          filepath: "/release.sha256"
+        - name: "checksums GPG signature"
+          url: "$S3/release.sha256.asc"
+          filepath: "/release.sha256.asc"
+        - name: "other release artifacts"
+          url: "$S3/index.html"
+          filepath: "/index.html"
